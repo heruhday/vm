@@ -1,0 +1,40 @@
+
+Title: AI Assistant Deletes Files When File Operations Are Interrupted or Exceed 400 Lines
+
+What Happened:
+When the AI assistant is performing file operations and either:
+1. The operation is interrupted (user cancellation, API errors, system hangs), OR
+2. The file content exceeds ~400 lines in a single write operation
+
+The target files are deleted instead of being preserved or properly written.
+
+Expected behavior: File operations should handle large files by chunking or streaming, and if write fails, files should be preserved in original state with proper error handling.
+
+Steps to Reproduce:
+1. Ask AI assistant to write or modify a large file (>400 lines)
+2. Either let the operation complete (it will fail and delete file) OR interrupt the operation before completion
+3. Check if file exists - it will be deleted/missing
+
+Additional Context:
+- User: heruhday
+- File: `src/codegen.rs` in vm project (800+ lines)
+- Multiple attempts to write file resulted in deletion
+- File not recoverable from git (was never committed)
+- Pattern: Every attempt to write >400 lines fails and deletes file
+- Platform: Windows 11, IDE: Visual Studio Code
+- Current working directory: `c:\Users\Heruh\source\vm\vm`
+- File size threshold: ~400 lines
+
+Root Causes:
+1. Size limitation: System cannot handle >400 lines in single write
+2. No chunking: No automatic splitting of large content
+3. Poor error handling: Errors lead to file deletion instead of preservation
+4. No rollback: Interrupted operations don't restore original state
+
+Suggested Fixes:
+1. Implement automatic chunking for files >300 lines
+2. Add atomic file operations with temporary files
+3. Implement proper rollback on interruption/failure
+4. Create backup copies before modification
+5. Add size validation with clear error messages
+6. Implement streaming write for large files

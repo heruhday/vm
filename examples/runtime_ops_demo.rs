@@ -1,9 +1,6 @@
 //! Runtime Operations Demo
 //! Demonstrates all operations from runtime_trait.rs
 
-use vm::js_value::*;
-use vm::runtime_trait::*;
-
 fn main() {
     println!("=== Runtime Operations Demo ===\n");
 

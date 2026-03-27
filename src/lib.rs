@@ -1,5 +1,6 @@
 pub mod asm;
 pub mod atoms;
+pub mod codegen;
 pub mod emit;
 pub mod gc;
 pub mod heap;

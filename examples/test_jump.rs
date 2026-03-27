@@ -35,7 +35,7 @@ fn main() {
     println!("  Loop start at instruction {}", loop_start);
 
     builder.emit_mov(255, 1); // instruction 2: load counter to ACC
-    builder.emit_jmp_false(255, 3); // instruction 3: if counter == 0, exit
+    builder.emit_jmp_false(255, 7); // instruction 3: if counter == 0, jump to the return path
 
     builder.emit_mov(255, 2); // instruction 4: load accumulator
     builder.emit_inc_acc(); // instruction 5: increment

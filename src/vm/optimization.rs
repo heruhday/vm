@@ -30,6 +30,13 @@ pub fn optimize_peephole(bytecode: Vec<u32>, constants: Vec<JSValue>) -> (Vec<u3
     crate::opt::optimize_peephole(bytecode, constants)
 }
 
+pub fn reuse_registers_linear_scan(
+    bytecode: Vec<u32>,
+    constants: Vec<JSValue>,
+) -> (Vec<u32>, Vec<JSValue>) {
+    crate::opt::reuse_registers_linear_scan(bytecode, constants)
+}
+
 pub fn relocate_jumps(bytecode: Vec<u32>, constants: Vec<JSValue>) -> (Vec<u32>, Vec<JSValue>) {
     crate::opt::relocate_jumps(bytecode, constants)
 }

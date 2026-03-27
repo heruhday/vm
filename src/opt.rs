@@ -96,6 +96,8 @@ impl Instruction {
             | Opcode::LoadKAddAcc
             | Opcode::LoadKMulAcc
             | Opcode::LoadKSubAcc
+            | Opcode::CallMethod1
+            | Opcode::CallMethod2
             | Opcode::Enter => {
                 ((self.bx as u32) << 16) | ((self.a as u32) << 8) | self.opcode.as_u8() as u32
             }
@@ -419,6 +421,98 @@ fn eliminate_dead_defs(
     changed
 }
 
+fn constant_fold_block(insts: &mut [Instruction], start: usize, end: usize) -> bool {
+    let mut changed = false;
+
+    loop {
+        let mut local_change = false;
+        let live_indices: Vec<_> = (start..end)
+            .filter(|&index| !insts[index].removed)
+            .collect();
+
+        for (pos, &index) in live_indices.iter().enumerate() {
+            if insts[index].removed {
+                continue;
+            }
+
+            if let (Some(&next_index), Some(&third_index)) =
+                (live_indices.get(pos + 1), live_indices.get(pos + 2))
+                && !insts[next_index].removed
+                && !insts[third_index].removed
+                && fold_const_add(insts, index, next_index, third_index)
+            {
+                local_change = true;
+            }
+        }
+
+        if !local_change {
+            break;
+        }
+
+        changed = true;
+    }
+
+    changed
+}
+
+fn optimize_basic_peephole_block(insts: &mut [Instruction], start: usize, end: usize) -> bool {
+    let mut changed = false;
+
+    loop {
+        let mut local_change = false;
+        let live_indices: Vec<_> = (start..end)
+            .filter(|&index| !insts[index].removed)
+            .collect();
+
+        for (pos, &index) in live_indices.iter().enumerate() {
+            if insts[index].removed {
+                continue;
+            }
+
+            if insts[index].opcode == Opcode::Mov && insts[index].a == insts[index].b {
+                insts[index].removed = true;
+                local_change = true;
+                continue;
+            }
+
+            let Some(&next_index) = live_indices.get(pos + 1) else {
+                continue;
+            };
+            if insts[next_index].removed {
+                continue;
+            }
+
+            if insts[index].opcode == Opcode::Mov
+                && insts[next_index].opcode == Opcode::Mov
+                && insts[next_index].a == insts[index].b
+                && insts[next_index].b == insts[index].a
+            {
+                insts[next_index].removed = true;
+                local_change = true;
+            }
+
+            if insts[next_index].opcode == Opcode::Mov && insts[next_index].a == insts[next_index].b
+            {
+                insts[next_index].removed = true;
+                local_change = true;
+                continue;
+            }
+
+            if rewrite_load_move(insts, index, next_index) {
+                local_change = true;
+            }
+        }
+
+        if !local_change {
+            break;
+        }
+
+        changed = true;
+    }
+
+    changed
+}
+
 fn optimize_peephole_block(insts: &mut [Instruction], start: usize, end: usize) -> bool {
     let mut changed = false;
 
@@ -429,6 +523,10 @@ fn optimize_peephole_block(insts: &mut [Instruction], start: usize, end: usize) 
             .collect();
 
         for (pos, &index) in live_indices.iter().enumerate() {
+            if insts[index].removed {
+                continue;
+            }
+
             if insts[index].opcode == Opcode::Mov && insts[index].a == insts[index].b {
                 insts[index].removed = true;
                 local_change = true;
@@ -436,6 +534,10 @@ fn optimize_peephole_block(insts: &mut [Instruction], start: usize, end: usize) 
             }
 
             if let Some(&next_index) = live_indices.get(pos + 1) {
+                if insts[next_index].removed {
+                    continue;
+                }
+
                 if insts[index].opcode == Opcode::Mov
                     && insts[next_index].opcode == Opcode::Mov
                     && insts[next_index].a == insts[index].b
@@ -445,16 +547,637 @@ fn optimize_peephole_block(insts: &mut [Instruction], start: usize, end: usize) 
                     local_change = true;
                 }
 
+                if insts[next_index].opcode == Opcode::Mov
+                    && insts[next_index].a == insts[next_index].b
+                {
+                    insts[next_index].removed = true;
+                    local_change = true;
+                    continue;
+                }
+
                 if rewrite_load_move(insts, index, next_index) {
+                    local_change = true;
+                }
+
+                // Pattern: LoadI + AddI -> LoadAdd
+                if insts[index].opcode == Opcode::LoadI
+                    && insts[next_index].opcode == Opcode::AddI
+                    && insts[next_index].b == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadAdd,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadI + SubI -> LoadSub
+                if insts[index].opcode == Opcode::LoadI
+                    && insts[next_index].opcode == Opcode::SubI
+                    && insts[next_index].b == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadSub,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadI + MulI -> LoadMul
+                if insts[index].opcode == Opcode::LoadI
+                    && insts[next_index].opcode == Opcode::MulI
+                    && insts[next_index].b == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadMul,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadI + Inc -> LoadInc
+                if insts[index].opcode == Opcode::LoadI
+                    && insts[next_index].opcode == Opcode::Inc
+                    && insts[next_index].a == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadInc,
+                        a: insts[index].a,
+                        b: 0,
+                        c: 0,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadI + Dec -> LoadDec
+                if insts[index].opcode == Opcode::LoadI
+                    && insts[next_index].opcode == Opcode::Dec
+                    && insts[next_index].a == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadDec,
+                        a: insts[index].a,
+                        b: 0,
+                        c: 0,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadI + Eq -> LoadCmpEq
+                if insts[index].opcode == Opcode::LoadI
+                    && insts[next_index].opcode == Opcode::Eq
+                    && insts[next_index].b == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadCmpEq,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadI + Lt -> LoadCmpLt
+                if insts[index].opcode == Opcode::LoadI
+                    && insts[next_index].opcode == Opcode::Lt
+                    && insts[next_index].b == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadCmpLt,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadI + JmpFalse -> LoadJfalse
+                if insts[index].opcode == Opcode::LoadI
+                    && insts[next_index].opcode == Opcode::JmpFalse
+                    && insts[next_index].a == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadJfalse,
+                        a: insts[index].a,
+                        b: 0,
+                        c: 0,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: insts[next_index].target,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadK + GetProp + Eq -> LoadGetPropCmpEq
+                if let Some(&third_index) = live_indices.get(pos + 2)
+                    && insts[index].opcode == Opcode::LoadK
+                    && insts[next_index].opcode == Opcode::GetProp
+                    && insts[third_index].opcode == Opcode::Eq
+                    && insts[next_index].b == insts[index].a
+                    && insts[third_index].b == insts[next_index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadGetPropCmpEq,
+                        a: insts[third_index].a,
+                        b: insts[index].a,
+                        c: insts[third_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    insts[third_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadK + GetProp -> LoadGetProp
+                if insts[index].opcode == Opcode::LoadK
+                    && insts[next_index].opcode == Opcode::GetProp
+                    && insts[next_index].b == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadGetProp,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: GetProp + GetProp + GetProp -> GetProp3Ic
+                if let Some(&third_index) = live_indices.get(pos + 2)
+                    && insts[index].opcode == Opcode::GetProp
+                    && insts[next_index].opcode == Opcode::GetProp
+                    && insts[third_index].opcode == Opcode::GetProp
+                    && insts[next_index].b == insts[index].a
+                    && insts[third_index].b == insts[next_index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::GetProp3Ic,
+                        a: insts[third_index].a,
+                        b: insts[index].b,
+                        c: insts[index].c,
+                        bx: 0,
+                        sbx: 0,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    insts[third_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: GetProp + GetProp + Call -> CallMethod2Ic
+                if let Some(&third_index) = live_indices.get(pos + 2)
+                    && insts[index].opcode == Opcode::GetProp
+                    && insts[next_index].opcode == Opcode::GetProp
+                    && insts[third_index].opcode == Opcode::Call
+                    && insts[next_index].b == insts[index].a
+                    && insts[third_index].a == insts[next_index].a
+                    && insts[third_index].b == 0
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::CallMethod2Ic,
+                        a: insts[index].b,
+                        b: insts[index].c,
+                        c: insts[next_index].c,
+                        bx: 0,
+                        sbx: 0,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    insts[third_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: GetProp + GetProp -> GetProp2Ic
+                if insts[index].opcode == Opcode::GetProp
+                    && insts[next_index].opcode == Opcode::GetProp
+                    && insts[next_index].b == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::GetProp2Ic,
+                        a: insts[next_index].a,
+                        b: insts[index].b,
+                        c: insts[index].c,
+                        bx: 0,
+                        sbx: 0,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadK + GetIdxFast -> GetElem
+                if insts[index].opcode == Opcode::LoadK
+                    && insts[next_index].opcode == Opcode::GetIdxFast
+                    && insts[next_index].b == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::GetElem,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadK + SetIdxFast -> SetElem
+                if insts[index].opcode == Opcode::LoadK
+                    && insts[next_index].opcode == Opcode::SetIdxFast
+                    && insts[next_index].b == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::SetElem,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: GetProp + GetIdxFast -> GetPropElem
+                if insts[index].opcode == Opcode::GetProp
+                    && insts[next_index].opcode == Opcode::GetIdxFast
+                    && insts[next_index].b == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::GetPropElem,
+                        a: insts[next_index].a,
+                        b: insts[index].b,
+                        c: insts[index].c,
+                        bx: 0,
+                        sbx: 0,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: GetProp + Call -> CallMethod*
+                if insts[index].opcode == Opcode::GetProp
+                    && insts[next_index].opcode == Opcode::Call
+                    && insts[next_index].a == insts[index].a
+                {
+                    match insts[next_index].b {
+                        0 => {
+                            insts[index] = Instruction {
+                                opcode: Opcode::CallMethodIc,
+                                a: insts[index].b,
+                                b: insts[index].c,
+                                c: 0,
+                                bx: 0,
+                                sbx: 0,
+                                target: None,
+                                removed: false,
+                            };
+                            insts[next_index].removed = true;
+                            local_change = true;
+                        }
+                        1 => {
+                            insts[index] = Instruction {
+                                opcode: Opcode::CallMethod1,
+                                a: insts[index].b,
+                                b: 0,
+                                c: 0,
+                                bx: insts[index].c as u16,
+                                sbx: insts[index].c as i16,
+                                target: None,
+                                removed: false,
+                            };
+                            insts[next_index].removed = true;
+                            local_change = true;
+                        }
+                        2 => {
+                            insts[index] = Instruction {
+                                opcode: Opcode::CallMethod2,
+                                a: insts[index].b,
+                                b: 0,
+                                c: 0,
+                                bx: insts[index].c as u16,
+                                sbx: insts[index].c as i16,
+                                target: None,
+                                removed: false,
+                            };
+                            insts[next_index].removed = true;
+                            local_change = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Pattern: GetPropIc + Call -> GetPropIcCall
+                if insts[index].opcode == Opcode::GetPropIc
+                    && insts[next_index].opcode == Opcode::Call
+                    && insts[next_index].a == insts[index].a
+                    && insts[next_index].b == 0
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::GetPropIcCall,
+                        a: insts[index].a,
+                        b: insts[index].b,
+                        c: insts[index].c,
+                        bx: 0,
+                        sbx: 0,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: IncAcc + JmpFalse -> IncJmpFalseLoop
+                if insts[index].opcode == Opcode::IncAcc
+                    && insts[next_index].opcode == Opcode::JmpFalse
+                    && insts[next_index].a == ACC
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::IncJmpFalseLoop,
+                        a: ACC,
+                        b: 0,
+                        c: 0,
+                        bx: 0,
+                        sbx: 0,
+                        target: insts[next_index].target,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadK + Add -> LoadKAdd
+                if insts[index].opcode == Opcode::LoadK
+                    && insts[next_index].opcode == Opcode::Add
+                    && insts[next_index].b == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadKAdd,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadK + Cmp -> LoadKCmp
+                if insts[index].opcode == Opcode::LoadK
+                    && insts[next_index].opcode == Opcode::Eq
+                    && insts[next_index].b == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadKCmp,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: Cmp + Jmp -> CmpJmp
+                if insts[index].opcode == Opcode::Eq
+                    && insts[next_index].opcode == Opcode::JmpFalse
+                    && insts[next_index].a == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::CmpJmp,
+                        a: insts[index].a,
+                        b: insts[index].b,
+                        c: insts[index].c,
+                        bx: 0,
+                        sbx: 0,
+                        target: insts[next_index].target,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadCmpEq + JmpFalse -> LoadCmpEqJfalse
+                if insts[index].opcode == Opcode::LoadCmpEq
+                    && insts[next_index].opcode == Opcode::JmpFalse
+                    && insts[next_index].a == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadCmpEqJfalse,
+                        a: insts[index].a,
+                        b: insts[index].b,
+                        c: insts[index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: insts[next_index].target,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadCmpLt + JmpFalse -> LoadCmpLtJfalse
+                if insts[index].opcode == Opcode::LoadCmpLt
+                    && insts[next_index].opcode == Opcode::JmpFalse
+                    && insts[next_index].a == insts[index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadCmpLtJfalse,
+                        a: insts[index].a,
+                        b: insts[index].b,
+                        c: insts[index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: insts[next_index].target,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadAcc + Add -> AddAccReg
+                if insts[index].opcode == Opcode::LoadAcc
+                    && insts[next_index].opcode == Opcode::Add
+                    && insts[next_index].b == ACC
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::AddAccReg,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: 0,
+                        sbx: 0,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: Call + Add -> Call1Add
+                if insts[index].opcode == Opcode::Call
+                    && insts[next_index].opcode == Opcode::Add
+                    && insts[next_index].b == ACC
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::Call1Add,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: 0,
+                        sbx: 0,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
                     local_change = true;
                 }
             }
 
             if let (Some(&next_index), Some(&third_index)) =
                 (live_indices.get(pos + 1), live_indices.get(pos + 2))
-                && fold_const_add(insts, index, next_index, third_index)
             {
-                local_change = true;
+                if insts[next_index].removed || insts[third_index].removed {
+                    continue;
+                }
+
+                if fold_const_add(insts, index, next_index, third_index) {
+                    local_change = true;
+                }
+
+                // Pattern: LoadI + Eq + JmpFalse -> LoadCmpEqJfalse
+                if insts[index].opcode == Opcode::LoadI
+                    && insts[next_index].opcode == Opcode::Eq
+                    && insts[third_index].opcode == Opcode::JmpFalse
+                    && insts[next_index].b == insts[index].a
+                    && insts[third_index].a == insts[next_index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadCmpEqJfalse,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: insts[third_index].target,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    insts[third_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: LoadI + Lt + JmpFalse -> LoadCmpLtJfalse
+                if insts[index].opcode == Opcode::LoadI
+                    && insts[next_index].opcode == Opcode::Lt
+                    && insts[third_index].opcode == Opcode::JmpFalse
+                    && insts[next_index].b == insts[index].a
+                    && insts[third_index].a == insts[next_index].a
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::LoadCmpLtJfalse,
+                        a: insts[next_index].a,
+                        b: insts[index].a,
+                        c: insts[next_index].c,
+                        bx: insts[index].bx,
+                        sbx: insts[index].sbx,
+                        target: insts[third_index].target,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    insts[third_index].removed = true;
+                    local_change = true;
+                }
+
+                // Pattern: Call + Call + Add -> Call2Add
+                if let Some(&third_index) = live_indices.get(pos + 2)
+                    && insts[index].opcode == Opcode::Call
+                    && insts[next_index].opcode == Opcode::Call
+                    && insts[third_index].opcode == Opcode::Add
+                    && insts[next_index].a == insts[index].a
+                    && insts[third_index].b == ACC
+                {
+                    insts[index] = Instruction {
+                        opcode: Opcode::Call2Add,
+                        a: insts[third_index].a,
+                        b: insts[index].a,
+                        c: insts[third_index].c,
+                        bx: 0,
+                        sbx: 0,
+                        target: None,
+                        removed: false,
+                    };
+                    insts[next_index].removed = true;
+                    insts[third_index].removed = true;
+                    local_change = true;
+                }
             }
         }
 
@@ -492,6 +1215,1066 @@ fn has_removed_instructions(insts: &[Instruction]) -> bool {
     insts.iter().any(|inst| inst.removed)
 }
 
+#[derive(Clone, Debug)]
+struct InstructionSemantics {
+    uses: Vec<u8>,
+    defs: Vec<u8>,
+    successors: Vec<usize>,
+    pinned: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveInterval {
+    reg: u8,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Debug)]
+struct LivenessAnalysis {
+    intervals: [Option<LiveInterval>; REG_COUNT],
+    pinned: [bool; REG_COUNT],
+}
+
+fn push_unique_reg(regs: &mut Vec<u8>, reg: u8) {
+    if !regs.contains(&reg) {
+        regs.push(reg);
+    }
+}
+
+fn push_call_bundle(regs: &mut Vec<u8>, base: u8, arg_count: u8) -> bool {
+    let last = base as usize + arg_count as usize;
+    if last >= ACC as usize {
+        return false;
+    }
+
+    for reg in base..=base + arg_count {
+        push_unique_reg(regs, reg);
+    }
+
+    true
+}
+
+fn normal_successors(pc: usize, len: usize) -> Vec<usize> {
+    if pc + 1 < len {
+        vec![pc + 1]
+    } else {
+        Vec::new()
+    }
+}
+
+fn target_successors(target: Option<usize>, len: usize) -> Vec<usize> {
+    target
+        .filter(|&target| target < len)
+        .into_iter()
+        .collect::<Vec<_>>()
+}
+
+fn conditional_successors(pc: usize, target: Option<usize>, len: usize) -> Vec<usize> {
+    let mut successors = target_successors(target, len);
+    if pc + 1 < len && !successors.contains(&(pc + 1)) {
+        successors.push(pc + 1);
+    }
+    successors
+}
+
+fn build_instruction_semantics(
+    insts: &[Instruction],
+    constants: &[JSValue],
+) -> Option<Vec<InstructionSemantics>> {
+    let len = insts.len();
+    let mut semantics = Vec::with_capacity(len);
+
+    for (pc, inst) in insts.iter().enumerate() {
+        let mut uses = Vec::new();
+        let mut defs = Vec::new();
+        let mut pinned = Vec::new();
+        let mut successors = normal_successors(pc, len);
+
+        match inst.opcode {
+            Opcode::Mov => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::LoadI
+            | Opcode::LoadK
+            | Opcode::LoadGlobalIc
+            | Opcode::GetGlobal
+            | Opcode::GetUpval
+            | Opcode::GetScope
+            | Opcode::ResolveScope
+            | Opcode::NewObj
+            | Opcode::NewArr
+            | Opcode::NewFunc
+            | Opcode::NewThis
+            | Opcode::LoadClosure
+            | Opcode::TypeofName
+            | Opcode::CreateEnv => {
+                push_unique_reg(&mut defs, inst.a);
+            }
+            Opcode::NewClass
+            | Opcode::Typeof
+            | Opcode::ToNum
+            | Opcode::ToStr
+            | Opcode::IsUndef
+            | Opcode::IsNull
+            | Opcode::DeleteProp
+            | Opcode::HasProp
+            | Opcode::Keys => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::ForIn => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::IteratorNext => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.a);
+            }
+            Opcode::Spread => {
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::SetGlobalIc
+            | Opcode::SetGlobal
+            | Opcode::SetUpval
+            | Opcode::SetScope
+            | Opcode::StoreName
+            | Opcode::InitName => {
+                push_unique_reg(&mut uses, inst.a);
+            }
+            Opcode::LoadName => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut defs, ACC);
+            }
+            Opcode::LoadArg => {
+                push_unique_reg(&mut defs, inst.a);
+            }
+            Opcode::LoadAcc => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.a);
+            }
+            Opcode::LoadThis => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+            }
+            Opcode::Load0
+            | Opcode::Load1
+            | Opcode::LoadNull
+            | Opcode::LoadTrue
+            | Opcode::LoadFalse
+            | Opcode::IcMiss
+            | Opcode::AssertValue
+            | Opcode::AssertOk
+            | Opcode::AssertFail
+            | Opcode::AssertThrows
+            | Opcode::AssertDoesNotThrow
+            | Opcode::AssertRejects
+            | Opcode::AssertDoesNotReject
+            | Opcode::AssertEqual
+            | Opcode::AssertNotEqual
+            | Opcode::AssertDeepEqual
+            | Opcode::AssertNotDeepEqual
+            | Opcode::AssertStrictEqual
+            | Opcode::AssertNotStrictEqual
+            | Opcode::AssertDeepStrictEqual
+            | Opcode::AssertNotDeepStrictEqual => {
+                push_unique_reg(&mut defs, ACC);
+            }
+            Opcode::Add
+            | Opcode::Eq
+            | Opcode::Lt
+            | Opcode::Lte
+            | Opcode::StrictEq
+            | Opcode::StrictNeq
+            | Opcode::BitAnd
+            | Opcode::BitOr
+            | Opcode::BitXor
+            | Opcode::Shl
+            | Opcode::Shr
+            | Opcode::Ushr
+            | Opcode::Pow
+            | Opcode::LogicalAnd
+            | Opcode::LogicalOr
+            | Opcode::NullishCoalesce
+            | Opcode::In
+            | Opcode::Instanceof
+            | Opcode::AddStr
+            | Opcode::EqI32Fast
+            | Opcode::LtI32Fast => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+            }
+            Opcode::AddAcc
+            | Opcode::SubAcc
+            | Opcode::MulAcc
+            | Opcode::DivAcc
+            | Opcode::AddStrAcc => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, ACC);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::AddAccImm8
+            | Opcode::SubAccImm8
+            | Opcode::MulAccImm8
+            | Opcode::DivAccImm8
+            | Opcode::IncAcc
+            | Opcode::LoadKAddAcc
+            | Opcode::LoadKMulAcc
+            | Opcode::LoadKSubAcc
+            | Opcode::IncAccJmp => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, ACC);
+            }
+            Opcode::AddI | Opcode::SubI | Opcode::MulI | Opcode::DivI | Opcode::ModI => {
+                push_unique_reg(&mut defs, ACC);
+                if inst.a != ACC {
+                    push_unique_reg(&mut defs, inst.a);
+                }
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::Mod => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+            }
+            Opcode::AddI32
+            | Opcode::AddF64
+            | Opcode::SubI32
+            | Opcode::SubF64
+            | Opcode::MulI32
+            | Opcode::MulF64
+            | Opcode::AddI32Fast
+            | Opcode::AddF64Fast
+            | Opcode::SubI32Fast
+            | Opcode::MulI32Fast => {
+                push_unique_reg(&mut defs, ACC);
+                if inst.a != ACC {
+                    push_unique_reg(&mut defs, inst.a);
+                }
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+            }
+            Opcode::Neg | Opcode::Inc | Opcode::Dec | Opcode::ToPrimitive | Opcode::BitNot => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::GetPropAcc => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+            }
+            Opcode::SetPropAcc => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, ACC);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+            }
+            Opcode::GetProp | Opcode::GetSuper | Opcode::GetPropIc | Opcode::GetPropMono => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::SetProp | Opcode::SetSuper | Opcode::SetPropIc => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::GetIdxFast | Opcode::GetElem => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+            }
+            Opcode::GetIdxIc => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+                push_unique_reg(&mut pinned, inst.c);
+            }
+            Opcode::SetIdxFast | Opcode::SetElem => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+            }
+            Opcode::SetIdxIc => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+                push_unique_reg(&mut pinned, inst.c);
+            }
+            Opcode::GetLengthIc => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::ArrayPushAcc => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, ACC);
+            }
+            Opcode::Jmp => {
+                successors = target_successors(inst.target, len);
+            }
+            Opcode::JmpTrue | Opcode::JmpFalse | Opcode::TestJmpTrue => {
+                push_unique_reg(&mut uses, inst.a);
+                successors = conditional_successors(pc, inst.target, len);
+            }
+            Opcode::JmpEq
+            | Opcode::JmpNeq
+            | Opcode::JmpLt
+            | Opcode::JmpLte
+            | Opcode::JmpLteFalse
+            | Opcode::JmpI32Fast => {
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+                successors = conditional_successors(pc, inst.target, len);
+            }
+            Opcode::EqJmpTrue | Opcode::LtJmp | Opcode::EqJmpFalse | Opcode::LteJmpLoop => {
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+                successors = conditional_successors(pc, inst.target, len);
+            }
+            Opcode::LoopIncJmp => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, ACC);
+                successors = conditional_successors(pc, inst.target, len);
+            }
+            Opcode::IncJmpFalseLoop => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, ACC);
+                push_unique_reg(&mut uses, inst.a);
+                successors = conditional_successors(pc, inst.target, len);
+            }
+            Opcode::Switch => {
+                push_unique_reg(&mut uses, inst.a);
+                successors = switch_targets(pc, inst.b as usize, constants);
+                if successors.is_empty() {
+                    successors = normal_successors(pc, len);
+                }
+            }
+            Opcode::Ret => {
+                push_unique_reg(&mut uses, ACC);
+                successors.clear();
+            }
+            Opcode::RetReg => {
+                push_unique_reg(&mut uses, inst.a);
+                successors.clear();
+            }
+            Opcode::RetU => {
+                successors.clear();
+            }
+            Opcode::Yield | Opcode::Await => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.a);
+            }
+            Opcode::ProfileType | Opcode::ProfileCall | Opcode::CheckType | Opcode::CheckStruct => {
+                if inst.b != 0 || inst.c != 0 {
+                    push_unique_reg(&mut uses, inst.b);
+                } else {
+                    push_unique_reg(&mut uses, ACC);
+                }
+            }
+            Opcode::ProfileRet => {
+                push_unique_reg(&mut uses, ACC);
+            }
+            Opcode::CheckIc => {
+                push_unique_reg(&mut defs, ACC);
+                if inst.b != 0 || inst.c != 0 {
+                    push_unique_reg(&mut uses, inst.b);
+                } else {
+                    push_unique_reg(&mut uses, ACC);
+                }
+            }
+            Opcode::IcInit | Opcode::IcUpdate => {
+                if inst.b != 0 || inst.c != 0 {
+                    push_unique_reg(&mut uses, inst.b);
+                } else {
+                    push_unique_reg(&mut uses, ACC);
+                }
+            }
+            Opcode::LoopHint
+            | Opcode::OsrEntry
+            | Opcode::ProfileHotLoop
+            | Opcode::OsrExit
+            | Opcode::JitHint
+            | Opcode::Enter
+            | Opcode::Leave => {}
+            Opcode::SafetyCheck => {
+                if inst.a != 0 {
+                    push_unique_reg(&mut uses, inst.a);
+                } else {
+                    push_unique_reg(&mut uses, ACC);
+                }
+            }
+            Opcode::Call1SubI => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::Call
+            | Opcode::TailCall
+            | Opcode::Construct
+            | Opcode::CallIc
+            | Opcode::CallIcSuper
+            | Opcode::CallMono => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+                if !push_call_bundle(&mut uses, inst.a, inst.b)
+                    || !push_call_bundle(&mut pinned, inst.a, inst.b)
+                {
+                    return None;
+                }
+            }
+            Opcode::ProfileHotCall => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+                if !push_call_bundle(&mut uses, inst.b, inst.c)
+                    || !push_call_bundle(&mut pinned, inst.b, inst.c)
+                {
+                    return None;
+                }
+            }
+            Opcode::CallRet => {
+                push_unique_reg(&mut uses, 0);
+                if !push_call_bundle(&mut uses, inst.a, inst.b)
+                    || !push_call_bundle(&mut pinned, inst.a, inst.b)
+                {
+                    return None;
+                }
+                successors.clear();
+            }
+            Opcode::CallVar | Opcode::CallIcVar => {
+                if inst.a as usize + 1 >= ACC as usize {
+                    return None;
+                }
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.a + 1);
+                push_unique_reg(&mut pinned, inst.a);
+                push_unique_reg(&mut pinned, inst.a + 1);
+            }
+            Opcode::Call0 => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+                push_unique_reg(&mut uses, inst.a);
+            }
+            Opcode::Call1 => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::Call2 => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+            }
+            Opcode::CallMethod1 => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+                if !push_call_bundle(&mut uses, inst.a, 1)
+                    || !push_call_bundle(&mut pinned, inst.a, 1)
+                {
+                    return None;
+                }
+            }
+            Opcode::CallMethod2 => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+                if !push_call_bundle(&mut uses, inst.a, 2)
+                    || !push_call_bundle(&mut pinned, inst.a, 2)
+                {
+                    return None;
+                }
+            }
+            Opcode::GetPropIcCall | Opcode::GetPropCall => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::AddMov
+            | Opcode::LoadAdd
+            | Opcode::LoadSub
+            | Opcode::LoadMul
+            | Opcode::LoadCmpEq
+            | Opcode::LoadCmpLt => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+                if matches!(inst.opcode, Opcode::AddMov) {
+                    push_unique_reg(&mut defs, ACC);
+                }
+            }
+            Opcode::GetPropAccCall => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+            }
+            Opcode::GetPropIcMov | Opcode::NewObjInitProp => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::GetPropAddImmSetPropIc => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::AddAccImm8Mov => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, ACC);
+            }
+            Opcode::LoadThisCall => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+            }
+            Opcode::GetLengthIcCall => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::AddStrAccMov | Opcode::MulAccMov => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, ACC);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::LoadArgCall => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+            }
+            Opcode::RetIfLteI => {
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+            }
+            Opcode::AddAccReg => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::Call1Add => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+                push_unique_reg(&mut uses, ACC);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::Call2Add => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, 0);
+                push_unique_reg(&mut uses, ACC);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+                push_unique_reg(&mut uses, inst.c);
+            }
+            Opcode::LoadKAdd => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, ACC);
+            }
+            Opcode::LoadKCmp | Opcode::LoadGetProp => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.a);
+            }
+            Opcode::LoadInc | Opcode::LoadDec => {
+                push_unique_reg(&mut defs, inst.a);
+                push_unique_reg(&mut uses, inst.b);
+            }
+            Opcode::CallMethodIc | Opcode::CallMethod2Ic => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.a);
+            }
+            Opcode::LoadGetPropCmpEq => {
+                push_unique_reg(&mut defs, ACC);
+                push_unique_reg(&mut uses, inst.a);
+                push_unique_reg(&mut uses, inst.c);
+            }
+            Opcode::CmpJmp
+            | Opcode::LoadJfalse
+            | Opcode::LoadCmpEqJfalse
+            | Opcode::LoadCmpLtJfalse
+            | Opcode::GetProp2Ic
+            | Opcode::GetProp3Ic
+            | Opcode::GetPropElem
+            | Opcode::Call3
+            | Opcode::GetPropChainAcc
+            | Opcode::Destructure
+            | Opcode::Throw
+            | Opcode::Try
+            | Opcode::EndTry
+            | Opcode::Catch
+            | Opcode::Finally
+            | Opcode::Reserved(_) => return None,
+        }
+
+        semantics.push(InstructionSemantics {
+            uses,
+            defs,
+            successors,
+            pinned,
+        });
+    }
+
+    Some(semantics)
+}
+
+fn union_live_sets(dst: &mut [bool; REG_COUNT], src: &[bool; REG_COUNT]) {
+    for index in 0..REG_COUNT {
+        dst[index] |= src[index];
+    }
+}
+
+fn extend_interval(intervals: &mut [Option<LiveInterval>; REG_COUNT], reg: usize, pc: usize) {
+    match &mut intervals[reg] {
+        Some(interval) => {
+            interval.start = interval.start.min(pc);
+            interval.end = interval.end.max(pc);
+        }
+        slot @ None => {
+            *slot = Some(LiveInterval {
+                reg: reg as u8,
+                start: pc,
+                end: pc,
+            });
+        }
+    }
+}
+
+fn analyze_liveness(insts: &[Instruction], constants: &[JSValue]) -> Option<LivenessAnalysis> {
+    let semantics = build_instruction_semantics(insts, constants)?;
+    let mut live_in = vec![[false; REG_COUNT]; insts.len()];
+    let mut live_out = vec![[false; REG_COUNT]; insts.len()];
+
+    loop {
+        let mut changed = false;
+
+        for pc in (0..insts.len()).rev() {
+            let mut next_out = [false; REG_COUNT];
+            for &succ in &semantics[pc].successors {
+                union_live_sets(&mut next_out, &live_in[succ]);
+            }
+
+            let mut next_in = next_out;
+            for &def in &semantics[pc].defs {
+                next_in[def as usize] = false;
+            }
+            for &use_reg in &semantics[pc].uses {
+                next_in[use_reg as usize] = true;
+            }
+
+            if live_out[pc] != next_out {
+                live_out[pc] = next_out;
+                changed = true;
+            }
+            if live_in[pc] != next_in {
+                live_in[pc] = next_in;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    let mut intervals = [None; REG_COUNT];
+    let mut pinned = [false; REG_COUNT];
+    pinned[0] = true;
+    pinned[ACC as usize] = true;
+
+    for (pc, info) in semantics.iter().enumerate() {
+        for &reg in &info.pinned {
+            pinned[reg as usize] = true;
+        }
+
+        for reg in 0..REG_COUNT {
+            if live_in[pc][reg] || live_out[pc][reg] {
+                extend_interval(&mut intervals, reg, pc);
+            }
+        }
+
+        for &reg in &info.uses {
+            extend_interval(&mut intervals, reg as usize, pc);
+        }
+        for &reg in &info.defs {
+            extend_interval(&mut intervals, reg as usize, pc);
+        }
+    }
+
+    Some(LivenessAnalysis { intervals, pinned })
+}
+
+fn rewrite_register_with_map(reg: &mut u8, map: &[u8; REG_COUNT]) {
+    *reg = map[*reg as usize];
+}
+
+fn rewrite_instruction_registers(inst: &mut Instruction, map: &[u8; REG_COUNT]) {
+    match inst.opcode {
+        Opcode::Mov => {
+            rewrite_register_with_map(&mut inst.a, map);
+            rewrite_register_with_map(&mut inst.b, map);
+        }
+        Opcode::LoadI
+        | Opcode::LoadK
+        | Opcode::LoadGlobalIc
+        | Opcode::GetGlobal
+        | Opcode::GetUpval
+        | Opcode::GetScope
+        | Opcode::ResolveScope
+        | Opcode::NewObj
+        | Opcode::NewArr
+        | Opcode::NewFunc
+        | Opcode::NewThis
+        | Opcode::LoadClosure
+        | Opcode::TypeofName
+        | Opcode::CreateEnv
+        | Opcode::LoadArg
+        | Opcode::IteratorNext
+        | Opcode::SetGlobalIc
+        | Opcode::SetGlobal
+        | Opcode::SetUpval
+        | Opcode::SetScope
+        | Opcode::StoreName
+        | Opcode::InitName
+        | Opcode::LoadAcc
+        | Opcode::JmpTrue
+        | Opcode::JmpFalse
+        | Opcode::TestJmpTrue
+        | Opcode::RetReg
+        | Opcode::Yield
+        | Opcode::Await
+        | Opcode::ArrayPushAcc
+        | Opcode::LoadKCmp
+        | Opcode::LoadGetProp
+        | Opcode::Call0
+        | Opcode::CallMethod1
+        | Opcode::CallMethod2
+        | Opcode::CallMethodIc
+        | Opcode::AddAccImm8Mov
+        | Opcode::LoadArgCall
+        | Opcode::IncJmpFalseLoop
+        | Opcode::LoadKAdd => {
+            rewrite_register_with_map(&mut inst.a, map);
+        }
+        Opcode::NewClass
+        | Opcode::Typeof
+        | Opcode::ToNum
+        | Opcode::ToStr
+        | Opcode::IsUndef
+        | Opcode::IsNull
+        | Opcode::DeleteProp
+        | Opcode::HasProp
+        | Opcode::Keys
+        | Opcode::GetProp
+        | Opcode::GetSuper
+        | Opcode::GetPropIc
+        | Opcode::GetPropMono
+        | Opcode::GetPropIcMov
+        | Opcode::NewObjInitProp => {
+            rewrite_register_with_map(&mut inst.a, map);
+            rewrite_register_with_map(&mut inst.b, map);
+        }
+        Opcode::ForIn => {
+            rewrite_register_with_map(&mut inst.a, map);
+            rewrite_register_with_map(&mut inst.b, map);
+        }
+        Opcode::Spread
+        | Opcode::SetProp
+        | Opcode::SetSuper
+        | Opcode::SetPropIc
+        | Opcode::GetIdxFast
+        | Opcode::GetIdxIc
+        | Opcode::GetElem
+        | Opcode::SetIdxFast
+        | Opcode::SetIdxIc
+        | Opcode::SetElem
+        | Opcode::Add
+        | Opcode::Eq
+        | Opcode::Lt
+        | Opcode::Lte
+        | Opcode::StrictEq
+        | Opcode::StrictNeq
+        | Opcode::BitAnd
+        | Opcode::BitOr
+        | Opcode::BitXor
+        | Opcode::Shl
+        | Opcode::Shr
+        | Opcode::Ushr
+        | Opcode::Pow
+        | Opcode::LogicalAnd
+        | Opcode::LogicalOr
+        | Opcode::NullishCoalesce
+        | Opcode::In
+        | Opcode::Instanceof
+        | Opcode::AddStr
+        | Opcode::EqI32Fast
+        | Opcode::LtI32Fast
+        | Opcode::JmpEq
+        | Opcode::JmpNeq
+        | Opcode::JmpLt
+        | Opcode::JmpLte
+        | Opcode::JmpLteFalse
+        | Opcode::JmpI32Fast
+        | Opcode::EqJmpTrue
+        | Opcode::LtJmp
+        | Opcode::EqJmpFalse
+        | Opcode::LteJmpLoop
+        | Opcode::Call1
+        | Opcode::LoadInc
+        | Opcode::LoadDec
+        | Opcode::CallMethod2Ic => {
+            rewrite_register_with_map(&mut inst.a, map);
+            rewrite_register_with_map(&mut inst.b, map);
+            if !matches!(
+                inst.opcode,
+                Opcode::LoadInc | Opcode::LoadDec | Opcode::CallMethodIc | Opcode::CallMethod2Ic
+            ) {
+                rewrite_register_with_map(&mut inst.c, map);
+            }
+        }
+        Opcode::Call2
+        | Opcode::GetPropAcc
+        | Opcode::SetPropAcc
+        | Opcode::AddMov
+        | Opcode::LoadAdd
+        | Opcode::LoadSub
+        | Opcode::LoadMul
+        | Opcode::LoadCmpEq
+        | Opcode::LoadCmpLt
+        | Opcode::LoadGetPropCmpEq
+        | Opcode::RetIfLteI
+        | Opcode::Call2Add
+        | Opcode::AddAccReg => {
+            rewrite_register_with_map(&mut inst.a, map);
+            rewrite_register_with_map(&mut inst.b, map);
+            rewrite_register_with_map(&mut inst.c, map);
+        }
+        Opcode::AddAcc
+        | Opcode::SubAcc
+        | Opcode::MulAcc
+        | Opcode::DivAcc
+        | Opcode::AddStrAcc
+        | Opcode::Neg
+        | Opcode::Inc
+        | Opcode::Dec
+        | Opcode::ToPrimitive
+        | Opcode::BitNot
+        | Opcode::GetLengthIc
+        | Opcode::GetLengthIcCall
+        | Opcode::GetPropAccCall
+        | Opcode::AddStrAccMov
+        | Opcode::MulAccMov
+        | Opcode::ProfileHotCall => {
+            rewrite_register_with_map(&mut inst.b, map);
+            if matches!(inst.opcode, Opcode::AddStrAccMov | Opcode::MulAccMov) {
+                rewrite_register_with_map(&mut inst.a, map);
+            }
+        }
+        Opcode::AddI
+        | Opcode::SubI
+        | Opcode::MulI
+        | Opcode::DivI
+        | Opcode::ModI
+        | Opcode::Mod
+        | Opcode::AddI32
+        | Opcode::AddF64
+        | Opcode::SubI32
+        | Opcode::SubF64
+        | Opcode::MulI32
+        | Opcode::MulF64
+        | Opcode::AddI32Fast
+        | Opcode::AddF64Fast
+        | Opcode::SubI32Fast
+        | Opcode::MulI32Fast => {
+            rewrite_register_with_map(&mut inst.a, map);
+            rewrite_register_with_map(&mut inst.b, map);
+            if !matches!(
+                inst.opcode,
+                Opcode::AddI | Opcode::SubI | Opcode::MulI | Opcode::DivI | Opcode::ModI
+            ) {
+                rewrite_register_with_map(&mut inst.c, map);
+            }
+        }
+        Opcode::LoopIncJmp
+        | Opcode::Call1SubI
+        | Opcode::GetPropIcCall
+        | Opcode::GetPropCall
+        | Opcode::Call1Add => {
+            rewrite_register_with_map(&mut inst.a, map);
+            rewrite_register_with_map(&mut inst.b, map);
+        }
+        Opcode::ProfileType | Opcode::ProfileCall | Opcode::CheckType | Opcode::CheckStruct => {
+            if inst.b != 0 || inst.c != 0 {
+                rewrite_register_with_map(&mut inst.b, map);
+            }
+        }
+        Opcode::CheckIc | Opcode::IcInit | Opcode::IcUpdate => {
+            if inst.b != 0 || inst.c != 0 {
+                rewrite_register_with_map(&mut inst.b, map);
+            }
+        }
+        Opcode::SafetyCheck => {
+            if inst.a != 0 {
+                rewrite_register_with_map(&mut inst.a, map);
+            }
+        }
+        Opcode::Call
+        | Opcode::TailCall
+        | Opcode::Construct
+        | Opcode::CallIc
+        | Opcode::CallIcSuper
+        | Opcode::CallMono
+        | Opcode::CallRet
+        | Opcode::CallVar
+        | Opcode::CallIcVar => {
+            rewrite_register_with_map(&mut inst.a, map);
+        }
+        Opcode::LoadThis
+        | Opcode::Load0
+        | Opcode::Load1
+        | Opcode::LoadNull
+        | Opcode::LoadTrue
+        | Opcode::LoadFalse
+        | Opcode::AddAccImm8
+        | Opcode::SubAccImm8
+        | Opcode::MulAccImm8
+        | Opcode::DivAccImm8
+        | Opcode::IncAcc
+        | Opcode::Ret
+        | Opcode::RetU
+        | Opcode::Jmp
+        | Opcode::Switch
+        | Opcode::LoopHint
+        | Opcode::ProfileRet
+        | Opcode::IcMiss
+        | Opcode::OsrEntry
+        | Opcode::ProfileHotLoop
+        | Opcode::OsrExit
+        | Opcode::JitHint
+        | Opcode::Enter
+        | Opcode::Leave
+        | Opcode::LoadKAddAcc
+        | Opcode::LoadKMulAcc
+        | Opcode::LoadKSubAcc
+        | Opcode::GetPropAddImmSetPropIc
+        | Opcode::LoadThisCall
+        | Opcode::IncAccJmp
+        | Opcode::AssertValue
+        | Opcode::AssertOk
+        | Opcode::AssertFail
+        | Opcode::AssertThrows
+        | Opcode::AssertDoesNotThrow
+        | Opcode::AssertRejects
+        | Opcode::AssertDoesNotReject
+        | Opcode::AssertEqual
+        | Opcode::AssertNotEqual
+        | Opcode::AssertDeepEqual
+        | Opcode::AssertNotDeepEqual
+        | Opcode::AssertStrictEqual
+        | Opcode::AssertNotStrictEqual
+        | Opcode::AssertDeepStrictEqual
+        | Opcode::AssertNotDeepStrictEqual => {}
+        Opcode::LoadName => {
+            rewrite_register_with_map(&mut inst.a, map);
+        }
+        Opcode::Reserved(_)
+        | Opcode::CmpJmp
+        | Opcode::LoadJfalse
+        | Opcode::LoadCmpEqJfalse
+        | Opcode::LoadCmpLtJfalse
+        | Opcode::GetProp2Ic
+        | Opcode::GetProp3Ic
+        | Opcode::GetPropElem
+        | Opcode::Call3
+        | Opcode::GetPropChainAcc
+        | Opcode::Destructure
+        | Opcode::Throw
+        | Opcode::Try
+        | Opcode::EndTry
+        | Opcode::Catch
+        | Opcode::Finally => {}
+    }
+}
+
+pub fn reuse_registers_linear_scan(
+    bytecode: Vec<u32>,
+    constants: Vec<JSValue>,
+) -> (Vec<u32>, Vec<JSValue>) {
+    let mut insts = decode_program(&bytecode);
+    let Some(liveness) = analyze_liveness(&insts, &constants) else {
+        return (bytecode, constants);
+    };
+
+    let mut map = [0u8; REG_COUNT];
+    for (index, slot) in map.iter_mut().enumerate() {
+        *slot = index as u8;
+    }
+
+    let mut available_regs = Vec::new();
+    for reg in 1..ACC {
+        if !liveness.pinned[reg as usize] {
+            available_regs.push(reg);
+        }
+    }
+
+    let mut intervals = liveness
+        .intervals
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|interval| {
+            interval.reg != 0 && interval.reg != ACC && !liveness.pinned[interval.reg as usize]
+        })
+        .collect::<Vec<_>>();
+    intervals.sort_by_key(|interval| (interval.start, interval.end, interval.reg));
+
+    let mut active = Vec::<(usize, u8)>::new();
+
+    for interval in intervals {
+        active.retain(|(end, _)| *end >= interval.start);
+
+        let mut occupied = [false; REG_COUNT];
+        for &(_, reg) in &active {
+            occupied[map[reg as usize] as usize] = true;
+        }
+
+        let physical = available_regs
+            .iter()
+            .copied()
+            .find(|&candidate| !occupied[candidate as usize])
+            .unwrap_or(interval.reg);
+
+        map[interval.reg as usize] = physical;
+        active.push((interval.end, interval.reg));
+    }
+
+    if map
+        .iter()
+        .enumerate()
+        .all(|(index, &reg)| reg == index as u8)
+    {
+        return (bytecode, constants);
+    }
+
+    for inst in &mut insts {
+        rewrite_instruction_registers(inst, &map);
+    }
+
+    let (rewritten, constants) = encode_program(&insts, constants);
+    if rewritten == bytecode {
+        return (bytecode, constants);
+    }
+    (rewritten, constants)
+}
+
 fn run_block_pass<F>(insts: &mut [Instruction], constants: &[JSValue], mut pass: F) -> bool
 where
     F: FnMut(&mut [Instruction], usize, usize, bool) -> bool,
@@ -508,11 +2291,15 @@ where
             .copied()
             .unwrap_or(insts.len())
             .min(insts.len());
-        let terminal = end == insts.len()
-            || (start..end)
-                .rev()
-                .find(|&index| !insts[index].removed)
-                .is_some_and(|index| is_terminator(insts[index].opcode));
+        let terminal = (start..end)
+            .rev()
+            .find(|&index| !insts[index].removed)
+            .is_some_and(|index| {
+                matches!(
+                    insts[index].opcode,
+                    Opcode::Ret | Opcode::RetU | Opcode::RetReg | Opcode::Throw
+                )
+            });
         if pass(insts, start, end, terminal) {
             changed = true;
         }
@@ -682,13 +2469,17 @@ fn coalesce_registers_block(insts: &mut [Instruction], start: usize, end: usize)
             | Opcode::NewThis
             | Opcode::LoadClosure
             | Opcode::ResolveScope
-            | Opcode::LoadName
+            | Opcode::InitName
             | Opcode::TypeofName
             | Opcode::CreateEnv
             | Opcode::Keys
             | Opcode::ForIn
             | Opcode::IteratorNext => {
                 invalidate_value_key(&mut available, &mut values, inst.a);
+            }
+            Opcode::LoadName => {
+                invalidate_value_key(&mut available, &mut values, inst.a);
+                invalidate_value_key(&mut available, &mut values, ACC);
             }
             Opcode::GetProp
             | Opcode::SetProp
@@ -862,13 +2653,17 @@ fn fold_temporary_checks_block(
             | Opcode::NewThis
             | Opcode::LoadClosure
             | Opcode::ResolveScope
-            | Opcode::LoadName
+            | Opcode::InitName
             | Opcode::TypeofName
             | Opcode::CreateEnv
             | Opcode::Keys
             | Opcode::ForIn
             | Opcode::IteratorNext => {
                 known[inst.a as usize] = KnownValueKind::Unknown;
+            }
+            Opcode::LoadName => {
+                known[inst.a as usize] = KnownValueKind::Unknown;
+                known[ACC as usize] = KnownValueKind::Unknown;
             }
             Opcode::GetProp
             | Opcode::SetProp
@@ -1021,22 +2816,28 @@ fn copy_propagation_block(insts: &mut [Instruction], start: usize, end: usize) -
                 invalidate_alias(&mut aliases, inst.a);
             }
             Opcode::GetProp
-            | Opcode::SetProp
             | Opcode::GetSuper
-            | Opcode::SetSuper
             | Opcode::DeleteProp
             | Opcode::HasProp
             | Opcode::GetPropIc
-            | Opcode::SetPropIc
-            | Opcode::GetIdxFast
-            | Opcode::SetIdxFast
-            | Opcode::GetIdxIc
-            | Opcode::SetIdxIc
             | Opcode::GetLengthIc => {
+                changed |= rewrite_reg(&aliases, &mut inst.b);
+                invalidate_alias(&mut aliases, inst.a);
+            }
+            Opcode::SetProp | Opcode::SetSuper | Opcode::SetPropIc => {
                 changed |= rewrite_reg(&aliases, &mut inst.a);
+                changed |= rewrite_reg(&aliases, &mut inst.b);
+                invalidate_alias(&mut aliases, ACC);
+            }
+            Opcode::GetIdxFast | Opcode::GetIdxIc => {
                 changed |= rewrite_reg(&aliases, &mut inst.b);
                 changed |= rewrite_reg(&aliases, &mut inst.c);
                 invalidate_alias(&mut aliases, inst.a);
+            }
+            Opcode::SetIdxFast | Opcode::SetIdxIc => {
+                changed |= rewrite_reg(&aliases, &mut inst.a);
+                changed |= rewrite_reg(&aliases, &mut inst.b);
+                changed |= rewrite_reg(&aliases, &mut inst.c);
                 invalidate_alias(&mut aliases, ACC);
             }
             Opcode::LoadAcc => {
@@ -1076,13 +2877,17 @@ fn copy_propagation_block(insts: &mut [Instruction], start: usize, end: usize) -
             | Opcode::NewThis
             | Opcode::LoadClosure
             | Opcode::ResolveScope
-            | Opcode::LoadName
+            | Opcode::InitName
             | Opcode::TypeofName
             | Opcode::CreateEnv
             | Opcode::Keys
             | Opcode::ForIn
             | Opcode::IteratorNext => {
                 invalidate_alias(&mut aliases, inst.a);
+            }
+            Opcode::LoadName => {
+                invalidate_alias(&mut aliases, inst.a);
+                invalidate_alias(&mut aliases, ACC);
             }
             Opcode::Ret | Opcode::RetU | Opcode::Jmp | Opcode::Switch | Opcode::LoopHint => {}
             _ => {
@@ -1193,8 +2998,7 @@ fn rewrite_switch_tables(insts: &[Instruction], constants: &mut [JSValue], bound
             if let Some(slot) = constants.get_mut(offset_index)
                 && let Some(old_offset) = to_f64(*slot)
             {
-                let old_target =
-                    ((pc + 1) as isize + old_offset as i16 as isize).max(0) as usize;
+                let old_target = ((pc + 1) as isize + old_offset as i16 as isize).max(0) as usize;
                 let new_target = boundary[old_target.min(insts.len())] as isize;
                 *slot = make_number((new_target - base) as f64);
             }
@@ -1205,6 +3009,17 @@ fn rewrite_switch_tables(insts: &[Instruction], constants: &mut [JSValue], bound
 pub fn simplify_branches(bytecode: Vec<u32>, constants: Vec<JSValue>) -> (Vec<u32>, Vec<JSValue>) {
     let mut insts = decode_program(&bytecode);
     if !thread_jumps(&mut insts) {
+        return (bytecode, constants);
+    }
+    encode_program(&insts, constants)
+}
+
+fn constant_fold(bytecode: Vec<u32>, constants: Vec<JSValue>) -> (Vec<u32>, Vec<JSValue>) {
+    let mut insts = decode_program(&bytecode);
+    let changed = run_block_pass(&mut insts, &constants, |insts, start, end, _terminal| {
+        constant_fold_block(insts, start, end)
+    });
+    if !changed {
         return (bytecode, constants);
     }
     encode_program(&insts, constants)
@@ -1282,6 +3097,27 @@ pub fn optimize_peephole(bytecode: Vec<u32>, constants: Vec<JSValue>) -> (Vec<u3
     encode_program(&insts, constants)
 }
 
+fn optimize_basic_peephole(
+    bytecode: Vec<u32>,
+    constants: Vec<JSValue>,
+) -> (Vec<u32>, Vec<JSValue>) {
+    let mut insts = decode_program(&bytecode);
+    let changed = run_block_pass(&mut insts, &constants, |insts, start, end, _terminal| {
+        optimize_basic_peephole_block(insts, start, end)
+    });
+    if !changed {
+        return (bytecode, constants);
+    }
+    encode_program(&insts, constants)
+}
+
+fn optimize_superinstructions(
+    bytecode: Vec<u32>,
+    constants: Vec<JSValue>,
+) -> (Vec<u32>, Vec<JSValue>) {
+    optimize_peephole(bytecode, constants)
+}
+
 pub fn relocate_jumps(bytecode: Vec<u32>, constants: Vec<JSValue>) -> (Vec<u32>, Vec<JSValue>) {
     let insts = decode_program(&bytecode);
     if !has_removed_instructions(&insts) {
@@ -1290,14 +3126,113 @@ pub fn relocate_jumps(bytecode: Vec<u32>, constants: Vec<JSValue>) -> (Vec<u32>,
     encode_program(&insts, constants)
 }
 
-pub fn optimize_bytecode(bytecode: Vec<u32>, constants: Vec<JSValue>) -> (Vec<u32>, Vec<JSValue>) {
-    let (bytecode, constants) = simplify_branches(bytecode, constants);
-    let (bytecode, constants) = copy_propagation(bytecode, constants);
-    let (bytecode, constants) = optimize_peephole(bytecode, constants);
+fn run_until_stable<F>(
+    mut bytecode: Vec<u32>,
+    mut constants: Vec<JSValue>,
+    max_rounds: usize,
+    mut round: F,
+) -> (Vec<u32>, Vec<JSValue>)
+where
+    F: FnMut(Vec<u32>, Vec<JSValue>) -> (Vec<u32>, Vec<JSValue>),
+{
+    for _ in 0..max_rounds {
+        let prev_bytecode = bytecode.clone();
+        let prev_constants = constants.clone();
+        (bytecode, constants) = round(bytecode, constants);
+        if bytecode == prev_bytecode && constants == prev_constants {
+            break;
+        }
+    }
+    (bytecode, constants)
+}
+
+fn run_fixed_point_round(bytecode: Vec<u32>, constants: Vec<JSValue>) -> (Vec<u32>, Vec<JSValue>) {
+    let (bytecode, constants) = constant_fold(bytecode, constants);
+    let (bytecode, constants) = fold_temporary_checks(bytecode, constants);
     let (bytecode, constants) = coalesce_registers(bytecode, constants);
     let (bytecode, constants) = copy_propagation(bytecode, constants);
-    let (bytecode, constants) = fold_temporary_checks(bytecode, constants);
     let (bytecode, constants) = eliminate_dead_code(bytecode, constants);
+    let (bytecode, constants) = optimize_basic_peephole(bytecode, constants);
+    simplify_branches(bytecode, constants)
+}
+
+pub fn optimize_bytecode(bytecode: Vec<u32>, constants: Vec<JSValue>) -> (Vec<u32>, Vec<JSValue>) {
+    let (bytecode, constants) = run_until_stable(bytecode, constants, 8, run_fixed_point_round);
+    let (bytecode, constants) = reuse_registers_linear_scan(bytecode, constants);
+    let (bytecode, constants) = optimize_basic_peephole(bytecode, constants);
+    let (bytecode, constants) = optimize_superinstructions(bytecode, constants);
     let (bytecode, constants) = simplify_branches(bytecode, constants);
     relocate_jumps(bytecode, constants)
+}
+
+pub fn optimize_compiled(
+    mut compiled: crate::codegen::CompiledBytecode,
+) -> crate::codegen::CompiledBytecode {
+    if compiled.function_constants.is_empty() {
+        let (bytecode, constants) = optimize_bytecode(compiled.bytecode, compiled.constants);
+        compiled.bytecode = bytecode;
+        compiled.constants = constants;
+        return compiled;
+    }
+
+    let mut function_entries = compiled
+        .function_constants
+        .iter()
+        .filter_map(|&slot| {
+            compiled
+                .constants
+                .get(slot as usize)
+                .and_then(|value| to_f64(*value))
+                .filter(|value| value.is_finite() && *value >= 0.0 && value.fract() == 0.0)
+                .map(|entry| (slot, entry as usize))
+        })
+        .collect::<Vec<_>>();
+    function_entries.sort_by_key(|&(_, entry_pc)| entry_pc);
+
+    if function_entries.is_empty() {
+        let (bytecode, constants) = optimize_bytecode(compiled.bytecode, compiled.constants);
+        compiled.bytecode = bytecode;
+        compiled.constants = constants;
+        return compiled;
+    }
+
+    let original_bytecode = compiled.bytecode;
+    let mut constants = compiled.constants;
+    let mut optimized = Vec::new();
+    let mut cursor = 0usize;
+
+    for (index, &(slot, entry_pc)) in function_entries.iter().enumerate() {
+        if entry_pc > cursor {
+            let (segment, next_constants) =
+                optimize_bytecode(original_bytecode[cursor..entry_pc].to_vec(), constants);
+            optimized.extend(segment);
+            constants = next_constants;
+        }
+
+        let next_entry = function_entries
+            .get(index + 1)
+            .map(|&(_, next_entry)| next_entry)
+            .unwrap_or(original_bytecode.len());
+        let new_entry = optimized.len();
+        if let Some(constant) = constants.get_mut(slot as usize) {
+            *constant = make_number(new_entry as f64);
+        }
+
+        let (segment, next_constants) =
+            optimize_bytecode(original_bytecode[entry_pc..next_entry].to_vec(), constants);
+        optimized.extend(segment);
+        constants = next_constants;
+        cursor = next_entry;
+    }
+
+    if cursor < original_bytecode.len() {
+        let (segment, next_constants) =
+            optimize_bytecode(original_bytecode[cursor..].to_vec(), constants);
+        optimized.extend(segment);
+        constants = next_constants;
+    }
+
+    compiled.bytecode = optimized;
+    compiled.constants = constants;
+    compiled
 }

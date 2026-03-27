@@ -103,6 +103,7 @@ impl AsmInstruction {
             | Opcode::ResolveScope
             | Opcode::LoadName
             | Opcode::StoreName
+            | Opcode::InitName
             | Opcode::TypeofName
             | Opcode::LoadKAddAcc
             | Opcode::LoadKMulAcc
@@ -183,6 +184,7 @@ impl AsmInstruction {
             | Opcode::AssertDoesNotReject => Format::A,
 
             Opcode::Add
+            | Opcode::Mod
             | Opcode::Eq
             | Opcode::Lt
             | Opcode::Lte
@@ -247,6 +249,51 @@ impl AsmInstruction {
             | Opcode::AddStrAccMov
             | Opcode::MulAccMov => Format::ABC,
 
+            // Superinstructions
+            Opcode::RetIfLteI
+            | Opcode::AddAccReg
+            | Opcode::Call1Add
+            | Opcode::Call2Add
+            | Opcode::LoadKAdd
+            | Opcode::LoadKCmp
+            | Opcode::CmpJmp
+            | Opcode::GetPropCall
+            | Opcode::CallRet => Format::ABC,
+            // Specialized opcodes
+            Opcode::AddI32Fast
+            | Opcode::AddF64Fast
+            | Opcode::SubI32Fast
+            | Opcode::MulI32Fast
+            | Opcode::EqI32Fast
+            | Opcode::LtI32Fast
+            | Opcode::JmpI32Fast
+            | Opcode::GetPropMono
+            | Opcode::CallMono => Format::ABC,
+            // Call opcodes
+            Opcode::Call0 | Opcode::Call1 | Opcode::Call2 | Opcode::Call3 => Format::ABC,
+            Opcode::CallMethod1 | Opcode::CallMethod2 => Format::ABx,
+            // New arithmetic superinstructions
+            Opcode::LoadAdd
+            | Opcode::LoadSub
+            | Opcode::LoadMul
+            | Opcode::LoadInc
+            | Opcode::LoadDec => Format::ABC,
+            // New comparison superinstructions
+            Opcode::LoadCmpEq
+            | Opcode::LoadCmpLt
+            | Opcode::LoadJfalse
+            | Opcode::LoadCmpEqJfalse
+            | Opcode::LoadCmpLtJfalse
+            | Opcode::LoadGetProp
+            | Opcode::LoadGetPropCmpEq => Format::ABC,
+            // Pareto 80% property access superinstructions with IC
+            Opcode::GetProp2Ic
+            | Opcode::GetProp3Ic
+            | Opcode::GetElem
+            | Opcode::SetElem
+            | Opcode::GetPropElem
+            | Opcode::CallMethodIc
+            | Opcode::CallMethod2Ic => Format::ABC,
             Opcode::Reserved(_) => Format::ABC,
         };
 
@@ -338,10 +385,32 @@ impl AsmInstruction {
                     Opcode::ResolveScope
                     | Opcode::LoadName
                     | Opcode::StoreName
+                    | Opcode::InitName
                     | Opcode::TypeofName => {
                         format!(
                             "{:04X}: {} r{}, identifier[{}]",
                             pc_byte_offset, opcode_str, self.a, self.bx
+                        )
+                    }
+                    Opcode::CallMethod1 => {
+                        format!(
+                            "{:04X}: {} r{}, property[{}], r{}",
+                            pc_byte_offset,
+                            opcode_str,
+                            self.a,
+                            self.bx,
+                            self.a.saturating_add(1)
+                        )
+                    }
+                    Opcode::CallMethod2 => {
+                        format!(
+                            "{:04X}: {} r{}, property[{}], r{}, r{}",
+                            pc_byte_offset,
+                            opcode_str,
+                            self.a,
+                            self.bx,
+                            self.a.saturating_add(1),
+                            self.a.saturating_add(2)
                         )
                     }
                     Opcode::LoadKAddAcc | Opcode::LoadKMulAcc | Opcode::LoadKSubAcc => {
@@ -493,205 +562,263 @@ impl AsmInstruction {
     fn opcode_to_clean_mnemonic(&self) -> &'static str {
         match self.opcode {
             Opcode::Mov => "mov",
-            Opcode::LoadK => "loadk",
+            Opcode::LoadK => "load_k",
             Opcode::Add => "add",
-            Opcode::GetPropIc => "getpropic",
+            Opcode::GetPropIc => "get_prop_ic",
             Opcode::Call => "call",
             Opcode::Jmp => "jmp",
-            Opcode::LoadI => "loadi",
-            Opcode::JmpTrue => "jmptrue",
-            Opcode::JmpFalse => "jmpfalse",
-            Opcode::SetPropIc => "setpropic",
-            Opcode::AddAccImm8 => "addaccimm8",
-            Opcode::IncAcc => "incacc",
-            Opcode::LoadThis => "loadthis",
-            Opcode::Load0 => "load0",
-            Opcode::Load1 => "load1",
+            Opcode::LoadI => "load_i",
+            Opcode::JmpTrue => "jmp_true",
+            Opcode::JmpFalse => "jmp_false",
+            Opcode::SetPropIc => "set_prop_ic",
+            Opcode::AddAccImm8 => "add_acc_imm8",
+            Opcode::IncAcc => "inc_acc",
+            Opcode::LoadThis => "load_this",
+            Opcode::Load0 => "load_0",
+            Opcode::Load1 => "load_1",
             Opcode::Eq => "eq",
             Opcode::Lt => "lt",
             Opcode::Lte => "lte",
-            Opcode::AddAcc => "addacc",
-            Opcode::SubAcc => "subacc",
-            Opcode::MulAcc => "mulacc",
-            Opcode::DivAcc => "divacc",
-            Opcode::LoadNull => "loadnull",
-            Opcode::LoadTrue => "loadtrue",
-            Opcode::LoadFalse => "loadfalse",
-            Opcode::LoadGlobalIc => "loadglobalic",
-            Opcode::SetGlobalIc => "setglobalic",
+            Opcode::AddAcc => "add_acc",
+            Opcode::SubAcc => "sub_acc",
+            Opcode::MulAcc => "mul_acc",
+            Opcode::DivAcc => "div_acc",
+            Opcode::LoadNull => "load_null",
+            Opcode::LoadTrue => "load_true",
+            Opcode::LoadFalse => "load_false",
+            Opcode::LoadGlobalIc => "load_global_ic",
+            Opcode::SetGlobalIc => "set_global_ic",
             Opcode::Typeof => "typeof",
-            Opcode::ToNum => "tonum",
-            Opcode::ToStr => "tostr",
-            Opcode::IsUndef => "isundef",
-            Opcode::IsNull => "isnull",
-            Opcode::SubAccImm8 => "subaccimm8",
-            Opcode::MulAccImm8 => "mulaccimm8",
-            Opcode::DivAccImm8 => "divaccimm8",
-            Opcode::AddStrAcc => "addstracc",
-            Opcode::AddI => "addi",
-            Opcode::SubI => "subi",
-            Opcode::MulI => "muli",
-            Opcode::DivI => "divi",
-            Opcode::ModI => "modi",
+            Opcode::ToNum => "to_num",
+            Opcode::ToStr => "to_str",
+            Opcode::IsUndef => "is_undef",
+            Opcode::IsNull => "is_null",
+            Opcode::SubAccImm8 => "sub_acc_imm8",
+            Opcode::MulAccImm8 => "mul_acc_imm8",
+            Opcode::DivAccImm8 => "div_acc_imm8",
+            Opcode::AddStrAcc => "add_str_acc",
+            Opcode::AddI => "add_i",
+            Opcode::SubI => "sub_i",
+            Opcode::MulI => "mul_i",
+            Opcode::DivI => "div_i",
+            Opcode::ModI => "mod_i",
+            Opcode::Mod => "mod",
             Opcode::Neg => "neg",
             Opcode::Inc => "inc",
             Opcode::Dec => "dec",
-            Opcode::AddStr => "addstr",
-            Opcode::ToPrimitive => "toprimitive",
-            Opcode::GetPropAcc => "getpropacc",
-            Opcode::SetPropAcc => "setpropacc",
-            Opcode::GetIdxFast => "getidxfast",
-            Opcode::SetIdxFast => "setidxfast",
-            Opcode::LoadArg => "loadarg",
-            Opcode::LoadAcc => "loadacc",
-            Opcode::StrictEq => "stricteq",
-            Opcode::StrictNeq => "strictneq",
-            Opcode::BitAnd => "bitand",
-            Opcode::BitOr => "bitor",
-            Opcode::BitXor => "bitxor",
-            Opcode::BitNot => "bitnot",
+            Opcode::AddStr => "add_str",
+            Opcode::ToPrimitive => "to_primitive",
+            Opcode::GetPropAcc => "get_prop_acc",
+            Opcode::SetPropAcc => "set_prop_acc",
+            Opcode::GetIdxFast => "get_idx_fast",
+            Opcode::SetIdxFast => "set_idx_fast",
+            Opcode::LoadArg => "load_arg",
+            Opcode::LoadAcc => "load_acc",
+            Opcode::StrictEq => "strict_eq",
+            Opcode::StrictNeq => "strict_neq",
+            Opcode::BitAnd => "bit_and",
+            Opcode::BitOr => "bit_or",
+            Opcode::BitXor => "bit_xor",
+            Opcode::BitNot => "bit_not",
             Opcode::Shl => "shl",
             Opcode::Shr => "shr",
             Opcode::Ushr => "ushr",
             Opcode::Pow => "pow",
-            Opcode::LogicalAnd => "logicaland",
-            Opcode::LogicalOr => "logicalor",
-            Opcode::NullishCoalesce => "nullishcoalesce",
+            Opcode::LogicalAnd => "logical_and",
+            Opcode::LogicalOr => "logical_or",
+            Opcode::NullishCoalesce => "nullish_coalesce",
             Opcode::In => "in",
             Opcode::Instanceof => "instanceof",
-            Opcode::GetLengthIc => "getlengthic",
-            Opcode::ArrayPushAcc => "arraypushacc",
-            Opcode::NewObj => "newobj",
-            Opcode::NewArr => "newarr",
-            Opcode::NewFunc => "newfunc",
-            Opcode::NewClass => "newclass",
-            Opcode::GetProp => "getprop",
-            Opcode::SetProp => "setprop",
-            Opcode::GetIdxIc => "getidxic",
-            Opcode::SetIdxIc => "setidxic",
-            Opcode::GetGlobal => "getglobal",
-            Opcode::SetGlobal => "setglobal",
-            Opcode::GetUpval => "getupval",
-            Opcode::SetUpval => "setupval",
-            Opcode::GetScope => "getscope",
-            Opcode::SetScope => "setscope",
-            Opcode::ResolveScope => "resolvescope",
-            Opcode::GetSuper => "getsuper",
-            Opcode::SetSuper => "setsuper",
-            Opcode::DeleteProp => "deleteprop",
-            Opcode::HasProp => "hasprop",
+            Opcode::GetLengthIc => "get_length_ic",
+            Opcode::ArrayPushAcc => "array_push_acc",
+            Opcode::NewObj => "new_obj",
+            Opcode::NewArr => "new_arr",
+            Opcode::NewFunc => "new_func",
+            Opcode::NewClass => "new_class",
+            Opcode::GetProp => "get_prop",
+            Opcode::SetProp => "set_prop",
+            Opcode::GetIdxIc => "get_idx_ic",
+            Opcode::SetIdxIc => "set_idx_ic",
+            Opcode::GetGlobal => "get_global",
+            Opcode::SetGlobal => "set_global",
+            Opcode::GetUpval => "get_upval",
+            Opcode::SetUpval => "set_upval",
+            Opcode::GetScope => "get_scope",
+            Opcode::SetScope => "set_scope",
+            Opcode::ResolveScope => "resolve_scope",
+            Opcode::GetSuper => "get_super",
+            Opcode::SetSuper => "set_super",
+            Opcode::DeleteProp => "delete_prop",
+            Opcode::HasProp => "has_prop",
             Opcode::Keys => "keys",
-            Opcode::ForIn => "forin",
-            Opcode::IteratorNext => "iteratornext",
+            Opcode::ForIn => "for_in",
+            Opcode::IteratorNext => "iterator_next",
             Opcode::Spread => "spread",
             Opcode::Destructure => "destructure",
-            Opcode::CreateEnv => "createenv",
-            Opcode::LoadName => "loadname",
-            Opcode::StoreName => "storename",
-            Opcode::LoadClosure => "loadclosure",
-            Opcode::NewThis => "newthis",
-            Opcode::TypeofName => "typeofname",
-            Opcode::JmpEq => "jmpeq",
-            Opcode::JmpNeq => "jmpneq",
-            Opcode::JmpLt => "jmplt",
-            Opcode::JmpLte => "jmplte",
-            Opcode::LoopIncJmp => "loopincjmp",
+            Opcode::CreateEnv => "create_env",
+            Opcode::LoadName => "load_name",
+            Opcode::StoreName => "store_name",
+            Opcode::InitName => "init_name",
+            Opcode::LoadClosure => "load_closure",
+            Opcode::NewThis => "new_this",
+            Opcode::TypeofName => "typeof_name",
+            Opcode::JmpEq => "jmp_eq",
+            Opcode::JmpNeq => "jmp_neq",
+            Opcode::JmpLt => "jmp_lt",
+            Opcode::JmpLte => "jmp_lte",
+            Opcode::LoopIncJmp => "loop_inc_jmp",
             Opcode::Switch => "switch",
-            Opcode::LoopHint => "loophint",
+            Opcode::LoopHint => "loop_hint",
             Opcode::Ret => "ret",
-            Opcode::RetU => "retu",
-            Opcode::RetReg => "retreg",
-            Opcode::TailCall => "tailcall",
+            Opcode::RetU => "ret_u",
+            Opcode::RetReg => "ret_reg",
+            Opcode::TailCall => "tail_call",
             Opcode::Construct => "construct",
-            Opcode::CallVar => "callvar",
+            Opcode::CallVar => "call_var",
             Opcode::Enter => "enter",
             Opcode::Leave => "leave",
             Opcode::Yield => "yield",
             Opcode::Await => "await",
             Opcode::Throw => "throw",
             Opcode::Try => "try",
-            Opcode::EndTry => "endtry",
+            Opcode::EndTry => "end_try",
             Opcode::Catch => "catch",
             Opcode::Finally => "finally",
-            Opcode::CallIc => "callic",
-            Opcode::CallIcVar => "callicvar",
-            Opcode::ProfileType => "profiletype",
-            Opcode::ProfileCall => "profilecall",
-            Opcode::ProfileRet => "profileret",
-            Opcode::CheckType => "checktype",
-            Opcode::CheckStruct => "checkstruct",
-            Opcode::CheckIc => "checkic",
-            Opcode::IcInit => "icinit",
-            Opcode::IcUpdate => "icupdate",
-            Opcode::IcMiss => "icmiss",
-            Opcode::OsrEntry => "osrentry",
-            Opcode::ProfileHotLoop => "profilehotloop",
-            Opcode::OsrExit => "osrexit",
-            Opcode::JitHint => "jithint",
-            Opcode::SafetyCheck => "safetycheck",
-            Opcode::GetPropIcCall => "getpropiccall",
-            Opcode::IncJmpFalseLoop => "incjmpfalseloop",
-            Opcode::LoadKAddAcc => "loadkaddacc",
-            Opcode::AddMov => "addmov",
-            Opcode::EqJmpTrue => "eqjmptrue",
-            Opcode::GetPropAccCall => "getpropacccall",
-            Opcode::LoadKMulAcc => "loadkmulacc",
-            Opcode::LtJmp => "ltjmp",
-            Opcode::GetPropIcMov => "getpropicmov",
-            Opcode::GetPropAddImmSetPropIc => "getpropaddimmsetpropic",
-            Opcode::AddAccImm8Mov => "addaccimm8mov",
-            Opcode::CallIcSuper => "callicsuper",
-            Opcode::LoadThisCall => "loadthiscall",
-            Opcode::EqJmpFalse => "eqjmpfalse",
-            Opcode::LoadKSubAcc => "loadksubacc",
-            Opcode::GetLengthIcCall => "getlengthiccall",
-            Opcode::AddStrAccMov => "addstraccmov",
-            Opcode::IncAccJmp => "incaccjmp",
-            Opcode::GetPropChainAcc => "getpropchainacc",
-            Opcode::TestJmpTrue => "testjmptrue",
-            Opcode::LoadArgCall => "loadargcall",
-            Opcode::MulAccMov => "mulaccmov",
-            Opcode::LteJmpLoop => "ltejmploop",
-            Opcode::NewObjInitProp => "newobjinitprop",
-            Opcode::ProfileHotCall => "profilehotcall",
-            Opcode::Call1SubI => "call1subi",
-            Opcode::JmpLteFalse => "jmpltefalse",
-            Opcode::AssertValue => "assertvalue",
-            Opcode::AssertOk => "assertok",
-            Opcode::AssertEqual => "assertequal",
-            Opcode::AssertNotEqual => "assertnotequal",
-            Opcode::AssertDeepEqual => "assertdeepequal",
-            Opcode::AssertNotDeepEqual => "assertnotdeepequal",
-            Opcode::AssertStrictEqual => "assertstrictequal",
-            Opcode::AssertNotStrictEqual => "assertnotstrictequal",
-            Opcode::AssertDeepStrictEqual => "assertdeepstrictequal",
-            Opcode::AssertNotDeepStrictEqual => "assertnotdeepstrictequal",
-            Opcode::AssertThrows => "assertthrows",
-            Opcode::AssertDoesNotThrow => "assertdoesnotthrow",
-            Opcode::AssertRejects => "assertrejects",
-            Opcode::AssertDoesNotReject => "assertdoesnotreject",
-            Opcode::AssertFail => "assertfail",
-            Opcode::AddI32 => "addi32",
-            Opcode::AddF64 => "addf64",
-            Opcode::SubI32 => "subi32",
-            Opcode::SubF64 => "subf64",
-            Opcode::MulI32 => "muli32",
-            Opcode::MulF64 => "mulf64",
-            Opcode::Reserved(n) => {
-                // Use a static string for reserved opcodes
-                match n {
-                    61..=63 => "reserved_61_63",
-                    123..=127 => "reserved_123_127",
-                    130..=159 => "reserved_130_159",
-                    174..=199 => "reserved_174_199",
-                    225..=239 => "reserved_225_239",
-                    243..=255 => "reserved_243_255",
-                    _ => "reserved",
-                }
-            }
+            Opcode::CallIc => "call_ic",
+            Opcode::CallIcVar => "call_ic_var",
+            Opcode::ProfileType => "profile_type",
+            Opcode::ProfileCall => "profile_call",
+            Opcode::ProfileRet => "profile_ret",
+            Opcode::CheckType => "check_type",
+            Opcode::CheckStruct => "check_struct",
+            Opcode::CheckIc => "check_ic",
+            Opcode::IcInit => "ic_init",
+            Opcode::IcUpdate => "ic_update",
+            Opcode::IcMiss => "ic_miss",
+            Opcode::OsrEntry => "osr_entry",
+            Opcode::ProfileHotLoop => "profile_hot_loop",
+            Opcode::OsrExit => "osr_exit",
+            Opcode::JitHint => "jit_hint",
+            Opcode::SafetyCheck => "safety_check",
+            Opcode::GetPropIcCall => "get_prop_ic_call",
+            Opcode::IncJmpFalseLoop => "inc_jmp_false_loop",
+            Opcode::LoadKAddAcc => "load_k_add_acc",
+            Opcode::AddMov => "add_mov",
+            Opcode::EqJmpTrue => "eq_jmp_true",
+            Opcode::GetPropAccCall => "get_prop_acc_call",
+            Opcode::LoadKMulAcc => "load_k_mul_acc",
+            Opcode::LtJmp => "lt_jmp",
+            Opcode::GetPropIcMov => "get_prop_ic_mov",
+            Opcode::GetPropAddImmSetPropIc => "get_prop_add_imm_set_prop_ic",
+            Opcode::AddAccImm8Mov => "add_acc_imm8_mov",
+            Opcode::CallIcSuper => "call_ic_super",
+            Opcode::LoadThisCall => "load_this_call",
+            Opcode::EqJmpFalse => "eq_jmp_false",
+            Opcode::LoadKSubAcc => "load_k_sub_acc",
+            Opcode::GetLengthIcCall => "get_length_ic_call",
+            Opcode::AddStrAccMov => "add_str_acc_mov",
+            Opcode::IncAccJmp => "inc_acc_jmp",
+            Opcode::GetPropChainAcc => "get_prop_chain_acc",
+            Opcode::TestJmpTrue => "test_jmp_true",
+            Opcode::LoadArgCall => "load_arg_call",
+            Opcode::MulAccMov => "mul_acc_mov",
+            Opcode::LteJmpLoop => "lte_jmp_loop",
+            Opcode::NewObjInitProp => "new_obj_init_prop",
+            Opcode::ProfileHotCall => "profile_hot_call",
+            Opcode::Call1SubI => "call1_sub_i",
+            Opcode::JmpLteFalse => "jmp_lte_false",
+
+            // Assertions
+            Opcode::AssertValue => "assert_value",
+            Opcode::AssertOk => "assert_ok",
+            Opcode::AssertEqual => "assert_equal",
+            Opcode::AssertNotEqual => "assert_not_equal",
+            Opcode::AssertDeepEqual => "assert_deep_equal",
+            Opcode::AssertNotDeepEqual => "assert_not_deep_equal",
+            Opcode::AssertStrictEqual => "assert_strict_equal",
+            Opcode::AssertNotStrictEqual => "assert_not_strict_equal",
+            Opcode::AssertDeepStrictEqual => "assert_deep_strict_equal",
+            Opcode::AssertNotDeepStrictEqual => "assert_not_deep_strict_equal",
+            Opcode::AssertThrows => "assert_throws",
+            Opcode::AssertDoesNotThrow => "assert_does_not_throw",
+            Opcode::AssertRejects => "assert_rejects",
+            Opcode::AssertDoesNotReject => "assert_does_not_reject",
+            Opcode::AssertFail => "assert_fail",
+
+            // Fast ops
+            Opcode::AddI32 => "add_i32",
+            Opcode::AddF64 => "add_f64",
+            Opcode::SubI32 => "sub_i32",
+            Opcode::SubF64 => "sub_f64",
+            Opcode::MulI32 => "mul_i32",
+            Opcode::MulF64 => "mul_f64",
+
+            // Superinstructions
+            Opcode::RetIfLteI => "ret_if_lte_i",
+            Opcode::AddAccReg => "add_acc_reg",
+            Opcode::Call1Add => "call1_add",
+            Opcode::Call2Add => "call2_add",
+            Opcode::LoadKAdd => "load_k_add",
+            Opcode::LoadKCmp => "load_k_cmp",
+            Opcode::CmpJmp => "cmp_jmp",
+            Opcode::GetPropCall => "get_prop_call",
+            Opcode::CallRet => "call_ret",
+
+            // Specialized
+            Opcode::AddI32Fast => "add_i32_fast",
+            Opcode::AddF64Fast => "add_f64_fast",
+            Opcode::SubI32Fast => "sub_i32_fast",
+            Opcode::MulI32Fast => "mul_i32_fast",
+            Opcode::EqI32Fast => "eq_i32_fast",
+            Opcode::LtI32Fast => "lt_i32_fast",
+            Opcode::JmpI32Fast => "jmp_i32_fast",
+            Opcode::GetPropMono => "get_prop_mono",
+            Opcode::CallMono => "call_mono",
+
+            // Call variants
+            Opcode::Call0 => "call0",
+            Opcode::Call1 => "call1",
+            Opcode::Call2 => "call2",
+            Opcode::Call3 => "call3",
+            Opcode::CallMethod1 => "call_method1",
+            Opcode::CallMethod2 => "call_method2",
+
+            // Arithmetic superinstructions
+            Opcode::LoadAdd => "load_add",
+            Opcode::LoadSub => "load_sub",
+            Opcode::LoadMul => "load_mul",
+            Opcode::LoadInc => "load_inc",
+            Opcode::LoadDec => "load_dec",
+
+            // Comparison superinstructions
+            Opcode::LoadCmpEq => "load_cmp_eq",
+            Opcode::LoadCmpLt => "load_cmp_lt",
+            Opcode::LoadJfalse => "load_jfalse",
+            Opcode::LoadCmpEqJfalse => "load_cmp_eq_jfalse",
+            Opcode::LoadCmpLtJfalse => "load_cmp_lt_jfalse",
+            Opcode::LoadGetProp => "load_get_prop",
+            Opcode::LoadGetPropCmpEq => "load_get_prop_cmp_eq",
+
+            // Pareto property access
+            Opcode::GetProp2Ic => "get_prop2_ic",
+            Opcode::GetProp3Ic => "get_prop3_ic",
+            Opcode::GetElem => "get_elem",
+            Opcode::SetElem => "set_elem",
+            Opcode::GetPropElem => "get_prop_elem",
+            Opcode::CallMethodIc => "call_method_ic",
+            Opcode::CallMethod2Ic => "call_method2_ic",
+
+            Opcode::Reserved(n) => match n {
+                61..=63 => "reserved_61_63",
+                123..=127 => "reserved_123_127",
+                130..=159 => "reserved_130_159",
+                174..=199 => "reserved_174_199",
+                225..=239 => "reserved_225_239",
+                243..=255 => "reserved_243_255",
+                _ => "reserved",
+            },
         }
     }
-
     /// Convert opcode to mnemonic string (with underscores)
     pub fn opcode_to_mnemonic(&self) -> &'static str {
         match self.opcode {
@@ -736,6 +863,7 @@ impl AsmInstruction {
             Opcode::MulI => "mul_i",
             Opcode::DivI => "div_i",
             Opcode::ModI => "mod_i",
+            Opcode::Mod => "mod",
             Opcode::Neg => "neg",
             Opcode::Inc => "inc",
             Opcode::Dec => "dec",
@@ -791,6 +919,7 @@ impl AsmInstruction {
             Opcode::CreateEnv => "create_env",
             Opcode::LoadName => "load_name",
             Opcode::StoreName => "store_name",
+            Opcode::InitName => "init_name",
             Opcode::LoadClosure => "load_closure",
             Opcode::NewThis => "new_this",
             Opcode::TypeofName => "typeof_name",
@@ -880,6 +1009,55 @@ impl AsmInstruction {
             Opcode::SubF64 => "sub_f64",
             Opcode::MulI32 => "mul_i32",
             Opcode::MulF64 => "mul_f64",
+            // Superinstructions
+            Opcode::RetIfLteI => "ret_if_lte_i",
+            Opcode::AddAccReg => "add_acc_reg",
+            Opcode::Call1Add => "call1_add",
+            Opcode::Call2Add => "call2_add",
+            Opcode::LoadKAdd => "load_k_add",
+            Opcode::LoadKCmp => "load_k_cmp",
+            Opcode::CmpJmp => "cmp_jmp",
+            Opcode::GetPropCall => "get_prop_call",
+            Opcode::CallRet => "call_ret",
+            // Specialized opcodes
+            Opcode::AddI32Fast => "add_i32_fast",
+            Opcode::AddF64Fast => "add_f64_fast",
+            Opcode::SubI32Fast => "sub_i32_fast",
+            Opcode::MulI32Fast => "mul_i32_fast",
+            Opcode::EqI32Fast => "eq_i32_fast",
+            Opcode::LtI32Fast => "lt_i32_fast",
+            Opcode::JmpI32Fast => "jmp_i32_fast",
+            Opcode::GetPropMono => "get_prop_mono",
+            Opcode::CallMono => "call_mono",
+            // Call opcodes
+            Opcode::Call0 => "call0",
+            Opcode::Call1 => "call1",
+            Opcode::Call2 => "call2",
+            Opcode::Call3 => "call3",
+            Opcode::CallMethod1 => "call_method1",
+            Opcode::CallMethod2 => "call_method2",
+            // New arithmetic superinstructions
+            Opcode::LoadAdd => "load_add",
+            Opcode::LoadSub => "load_sub",
+            Opcode::LoadMul => "load_mul",
+            Opcode::LoadInc => "load_inc",
+            Opcode::LoadDec => "load_dec",
+            // New comparison superinstructions
+            Opcode::LoadCmpEq => "load_cmp_eq",
+            Opcode::LoadCmpLt => "load_cmp_lt",
+            Opcode::LoadJfalse => "load_jfalse",
+            Opcode::LoadCmpEqJfalse => "load_cmp_eq_jfalse",
+            Opcode::LoadCmpLtJfalse => "load_cmp_lt_jfalse",
+            Opcode::LoadGetProp => "load_get_prop",
+            Opcode::LoadGetPropCmpEq => "load_get_prop_cmp_eq",
+            // Pareto 80% property access superinstructions with IC
+            Opcode::GetProp2Ic => "get_prop2_ic",
+            Opcode::GetProp3Ic => "get_prop3_ic",
+            Opcode::GetElem => "get_elem",
+            Opcode::SetElem => "set_elem",
+            Opcode::GetPropElem => "get_prop_elem",
+            Opcode::CallMethodIc => "call_method_ic",
+            Opcode::CallMethod2Ic => "call_method2_ic",
             Opcode::Reserved(n) => match n {
                 61..=63 => "reserved_61_63",
                 123..=127 => "reserved_123_127",
@@ -949,8 +1127,28 @@ impl AsmInstruction {
                     Opcode::ResolveScope
                     | Opcode::LoadName
                     | Opcode::StoreName
+                    | Opcode::InitName
                     | Opcode::TypeofName => {
                         format!("{} r{}, identifier[{}]", opcode_str, self.a, self.bx)
+                    }
+                    Opcode::CallMethod1 => {
+                        format!(
+                            "{} r{}, property[{}], r{}",
+                            opcode_str,
+                            self.a,
+                            self.bx,
+                            self.a.saturating_add(1)
+                        )
+                    }
+                    Opcode::CallMethod2 => {
+                        format!(
+                            "{} r{}, property[{}], r{}, r{}",
+                            opcode_str,
+                            self.a,
+                            self.bx,
+                            self.a.saturating_add(1),
+                            self.a.saturating_add(2)
+                        )
                     }
                     Opcode::LoadKAddAcc | Opcode::LoadKMulAcc | Opcode::LoadKSubAcc => {
                         let const_idx = self.bx as usize;

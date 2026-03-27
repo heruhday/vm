@@ -5,3 +5,9 @@ edition = "2024"
 
 [dependencies]
 bitflags = "2"
+chrono = "0.4.42"
+gc3 = { path = "../gc3" }
+itoa = "1.0.14"
+ryu = "1.0.23"
+serde = "1.0.217"
+serde_json = "1.0.149"

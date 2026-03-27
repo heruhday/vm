@@ -43,7 +43,7 @@ fn main() {
 
     // Check if i <= 5
     builder.emit_lte(2, 3); // ACC = i <= 5
-    builder.emit_jmp_false(255, 5); // if false, jump to end
+    builder.emit_jmp_false(255, 6); // if false, jump past the loop-back jmp to the return path
 
     // sum = sum + i
     builder.emit_add(1, 2); // ACC = sum + i

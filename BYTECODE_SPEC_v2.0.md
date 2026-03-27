@@ -27,189 +27,292 @@ The accumulator is register 255. Opcodes are grouped by hotness.
 
 | Op | Mnemonic         | Format | Description |
 |----|------------------|--------|-------------|
-| 0  | mov              | ABC    | `regs[A] = regs[B]` |
-| 1  | load_k           | ABx    | `regs[A] = constant[Bx]` |
-| 2  | add              | BC     | `acc = regs[B] + regs[C]` |
-| 3  | get_prop_ic      | ABC    | `regs[A] = regs[B][IC[C].key]` (IC slot C) |
-| 4  | call             | A B    | Call `regs[A]` with B args in `A+1..A+B`, result in acc |
-| 5  | jmp              | sBx    | Unconditional jump by signed 16‑bit offset |
-| 6  | load_i           | AsBx   | `regs[A] = (int16_t)sBx` |
-| 7  | jmp_true         | AsBx   | Jump if `regs[A]` truthy |
-| 8  | jmp_false        | AsBx   | Jump if `regs[A]` falsy |
-| 9  | set_prop_ic      | ABC    | `regs[B][IC[C].key] = regs[A]` (IC slot C) |
-| 10 | add_acc_imm8     | B      | `acc += (int8_t)B` |
-| 11 | inc_acc          | –      | `acc++` |
-| 12 | load_this        | –      | `acc = this` |
-| 13 | load_0           | –      | `acc = 0` |
-| 14 | load_1           | –      | `acc = 1` |
-| 15 | eq               | BC     | `acc = (regs[B] == regs[C])` (abstract equality) |
-| 16 | lt               | BC     | `acc = (regs[B] < regs[C])` |
-| 17 | lte              | BC     | `acc = (regs[B] <= regs[C])` |
-| 18 | add_acc          | B      | `acc += regs[B]` |
-| 19 | sub_acc          | B      | `acc -= regs[B]` |
-| 20 | mul_acc          | B      | `acc *= regs[B]` |
-| 21 | div_acc          | B      | `acc /= regs[B]` |
-| 22 | load_null        | –      | `acc = null` |
-| 23 | load_true        | –      | `acc = true` |
-| 24 | load_false       | –      | `acc = false` |
-| 25 | load_global_ic   | ABx    | `regs[A] = global[IC[Bx]]` (global IC) |
-| 26 | set_global_ic    | ABx    | `global[IC[Bx]] = regs[A]` |
-| 27 | typeof           | AB     | `regs[A] = interned_string(typeof regs[B])` |
-| 28 | to_num           | AB     | `regs[A] = ToNumber(regs[B])` |
-| 29 | to_str           | AB     | `regs[A] = ToString(regs[B])` |
-| 30 | is_undef         | AB     | `regs[A] = (regs[B] === undefined)` |
-| 31 | is_null          | AB     | `regs[A] = (regs[B] === null)` |
+| 0  | Mov              | ABC    | `regs[A] = regs[B]` |
+| 1  | LoadK            | ABx    | `regs[A] = constant[Bx]` |
+| 2  | Add              | BC     | `acc = regs[B] + regs[C]` |
+| 3  | GetPropIc        | ABC    | `regs[A] = regs[B][IC[C].key]` (IC slot C) |
+| 4  | Call             | A B    | Call `regs[A]` with B args in `A+1..A+B`, result in acc |
+| 5  | Jmp              | sBx    | Unconditional jump by signed 16‑bit offset |
+| 6  | LoadI            | AsBx   | `regs[A] = (int16_t)sBx` |
+| 7  | JmpTrue          | AsBx   | Jump if `regs[A]` truthy |
+| 8  | JmpFalse         | AsBx   | Jump if `regs[A]` falsy |
+| 9  | SetPropIc        | ABC    | `regs[B][IC[C].key] = regs[A]` (IC slot C) |
+| 10 | AddAccImm8       | B      | `acc += (int8_t)B` |
+| 11 | IncAcc           | –      | `acc++` |
+| 12 | LoadThis         | –      | `acc = this` |
+| 13 | Load0            | –      | `acc = 0` |
+| 14 | Load1            | –      | `acc = 1` |
+| 15 | Eq               | BC     | `acc = (regs[B] == regs[C])` (abstract equality) |
+| 16 | Lt               | BC     | `acc = (regs[B] < regs[C])` |
+| 17 | Lte              | BC     | `acc = (regs[B] <= regs[C])` |
+| 18 | AddAcc           | B      | `acc += regs[B]` |
+| 19 | SubAcc           | B      | `acc -= regs[B]` |
+| 20 | MulAcc           | B      | `acc *= regs[B]` |
+| 21 | DivAcc           | B      | `acc /= regs[B]` |
+| 22 | LoadNull         | –      | `acc = null` |
+| 23 | LoadTrue         | –      | `acc = true` |
+| 24 | LoadFalse        | –      | `acc = false` |
+| 25 | LoadGlobalIc     | ABx    | `regs[A] = global[IC[Bx]]` (global IC) |
+| 26 | SetGlobalIc      | ABx    | `global[IC[Bx]] = regs[A]` |
+| 27 | Typeof           | AB     | `regs[A] = interned_string(typeof regs[B])` |
+| 28 | ToNum            | AB     | `regs[A] = ToNumber(regs[B])` |
+| 29 | ToStr            | AB     | `regs[A] = ToString(regs[B])` |
+| 30 | IsUndef          | AB     | `regs[A] = (regs[B] === undefined)` |
+| 31 | IsNull           | AB     | `regs[A] = (regs[B] === null)` |
 
 ### 3.2 Arithmetic & Chaining (32–63)
 
 | Op | Mnemonic         | Format | Description |
 |----|------------------|--------|-------------|
-| 32 | sub_acc_imm8     | B      | `acc -= (int8_t)B` |
-| 33 | mul_acc_imm8     | B      | `acc *= (int8_t)B` |
-| 34 | div_acc_imm8     | B      | `acc /= (int8_t)B` |
-| 35 | add_str_acc      | B      | `acc += ToString(regs[B])` |
-| 36 | add_i            | ABC    | `acc = regs[B] + (int8_t)C`; store to regs[A] if A≠255 |
-| 37 | sub_i            | ABC    | `acc = regs[B] - (int8_t)C` |
-| 38 | mul_i            | ABC    | `acc = regs[B] * (int8_t)C` |
-| 39 | div_i            | ABC    | `acc = regs[B] / (int8_t)C` |
-| 40 | mod_i            | ABC    | `acc = regs[B] % (int8_t)C` |
-| 41 | neg              | B      | `acc = -regs[B]` |
-| 42 | inc              | B      | `acc = regs[B] + 1` |
-| 43 | dec              | B      | `acc = regs[B] - 1` |
-| 44 | add_str          | BC     | `acc = ToString(regs[B]) + ToString(regs[C])` |
-| 45 | to_primitive     | B      | `acc = ToPrimitive(regs[B])` |
-| 46 | get_prop_acc     | BC     | `acc = regs[B][regs[C]]` (property name in register) |
-| 47 | set_prop_acc     | BC     | `regs[B][regs[C]] = acc` |
-| 48 | get_idx_fast     | ABC    | `regs[A] = regs[B][regs[C]]` (fast array path) |
-| 49 | set_idx_fast     | ABC    | `regs[B][regs[C]] = regs[A]` (fast array path) |
-| 50 | load_arg         | AB     | `regs[A] = (B < argc) ? args[B] : undefined` |
-| 51 | load_acc         | A      | `acc = regs[A]` |
-| 52 | strict_eq        | BC     | `acc = (regs[B] === regs[C])` |
-| 53 | strict_neq       | BC     | `acc = (regs[B] !== regs[C])` |
-| 54–63 | reserved       |        | |
+| 32 | SubAccImm8       | B      | `acc -= (int8_t)B` |
+| 33 | MulAccImm8       | B      | `acc *= (int8_t)B` |
+| 34 | DivAccImm8       | B      | `acc /= (int8_t)B` |
+| 35 | AddStrAcc        | B      | `acc += ToString(regs[B])` |
+| 36 | AddI             | ABC    | `acc = regs[B] + (int8_t)C`; store to regs[A] if A≠255 |
+| 37 | SubI             | ABC    | `acc = regs[B] - (int8_t)C` |
+| 38 | MulI             | ABC    | `acc = regs[B] * (int8_t)C` |
+| 39 | DivI             | ABC    | `acc = regs[B] / (int8_t)C` |
+| 40 | ModI             | ABC    | `acc = regs[B] % (int8_t)C` |
+| 41 | Neg              | B      | `acc = -regs[B]` |
+| 42 | Inc              | B      | `acc = regs[B] + 1` |
+| 43 | Dec              | B      | `acc = regs[B] - 1` |
+| 44 | AddStr           | BC     | `acc = ToString(regs[B]) + ToString(regs[C])` |
+| 45 | ToPrimitive      | B      | `acc = ToPrimitive(regs[B])` |
+| 46 | GetPropAcc       | BC     | `acc = regs[B][regs[C]]` (property name in register) |
+| 47 | SetPropAcc       | BC     | `regs[B][regs[C]] = acc` |
+| 48 | GetIdxFast       | ABC    | `regs[A] = regs[B][regs[C]]` (fast array path) |
+| 49 | SetIdxFast       | ABC    | `regs[B][regs[C]] = regs[A]` (fast array path) |
+| 50 | LoadArg          | AB     | `regs[A] = (B < argc) ? args[B] : undefined` |
+| 51 | LoadAcc          | A      | `acc = regs[A]` |
+| 52 | StrictEq         | BC     | `acc = (regs[B] === regs[C])` |
+| 53 | StrictNeq        | BC     | `acc = (regs[B] !== regs[C])` |
+| 54 | BitAnd           | BC     | `acc = regs[B] & regs[C]` (bitwise AND) |
+| 55 | BitOr            | BC     | `acc = regs[B] | regs[C]` (bitwise OR) |
+| 56 | BitXor           | BC     | `acc = regs[B] ^ regs[C]` (bitwise XOR) |
+| 57 | BitNot           | B      | `acc = ~regs[B]` (bitwise NOT) |
+| 58 | Shl              | BC     | `acc = regs[B] << regs[C]` (left shift) |
+| 59 | Shr              | BC     | `acc = regs[B] >> regs[C]` (signed right shift) |
+| 60 | Ushr             | BC     | `acc = regs[B] >>> regs[C]` (unsigned right shift) |
+| 61 | reserved         |        | |
+| 62 | reserved         |        | |
+| 63 | reserved         |        | |
 
 ### 3.3 Property & Object (64–95)
 
 | Op | Mnemonic         | Format | Description |
 |----|------------------|--------|-------------|
-| 64 | get_length_ic    | ABC    | `regs[A] = regs[B].length` (IC slot C) |
-| 65 | array_push_acc   | A      | Push `acc` onto array `regs[A]` |
-| 66 | new_obj          | A      | `regs[A] = {}` |
-| 67 | new_arr          | AB     | `regs[A] = []` (size hint B) |
-| 68 | new_func         | ABx    | Create closure from descriptor at constant Bx, store in regs[A] |
-| 69 | new_class        | AB     | Create class with base `regs[B]`, store in regs[A] |
-| 70 | get_prop         | ABC    | Slow fallback: `regs[A] = regs[B][C]` |
-| 71 | set_prop         | ABC    | Slow fallback: `regs[B][C] = regs[A]` |
-| 72 | get_idx_ic       | ABC    | Keyed get with IC slot C, result in regs[A] |
-| 73 | set_idx_ic       | ABC    | Keyed set with IC slot C, store regs[A] |
-| 74 | get_global       | ABx    | Slow global load into regs[A] |
-| 75 | set_global       | ABx    | Slow global store from regs[A] |
-| 76 | get_upval        | AB     | Get upvalue at index B into regs[A] |
-| 77 | set_upval        | AB     | Set upvalue at index B to regs[A] |
-| 78 | get_scope        | AB     | Get lexical scope at depth B into regs[A] |
-| 79 | set_scope        | AB     | Set lexical scope at depth B to regs[A] |
-| 80 | resolve_scope    | ABx    | Resolve identifier Bx → environment in regs[A] |
-| 81 | get_super        | ABC    | Super property get into regs[A] |
-| 82 | set_super        | ABC    | Super property set with regs[A] |
-| 83 | delete_prop      | ABC    | `regs[A] = delete regs[B][C]` |
-| 84 | has_prop         | ABC    | `regs[A] = (C in regs[B])` |
-| 85 | keys             | AB     | `regs[A] = Object.keys(regs[B])` |
-| 86 | for_in           | AB     | Prepare for‑in: iterator in regs[A], first key in acc |
-| 87 | iterator_next    | A      | Get next value from iterator in regs[A], result in acc |
-| 88 | spread           | AB     | Spread elements from array regs[B] into array regs[A] |
-| 89 | destructure      | AB     | Destructure from source regs[B] into registers starting at A |
-| 90 | create_env       | A      | Create lexical environment, store in regs[A] |
-| 91 | load_name        | ABx    | Load variable by identifier constant Bx using scope, result in acc |
-| 92 | store_name       | ABx    | Store regs[A] into variable named by identifier constant Bx |
-| 93 | load_closure     | AB     | Load captured value from closure at index B into regs[A] |
-| 94 | new_this         | A      | Allocate this object for constructor, store in regs[A] |
-| 95 | typeof_name      | ABx    | `regs[A] = interned_string(typeof variable named Bx)` (no ReferenceError) |
+| 64 | GetLengthIc      | ABC    | `regs[A] = regs[B].length` (IC slot C) |
+| 65 | ArrayPushAcc     | A      | Push `acc` onto array `regs[A]` |
+| 66 | NewObj           | A      | `regs[A] = {}` |
+| 67 | NewArr           | AB     | `regs[A] = []` (size hint B) |
+| 68 | NewFunc          | ABx    | Create closure from descriptor at constant Bx, store in regs[A] |
+| 69 | NewClass         | AB     | Create class with base `regs[B]`, store in regs[A] |
+| 70 | GetProp          | ABC    | Slow fallback: `regs[A] = regs[B][C]` |
+| 71 | SetProp          | ABC    | Slow fallback: `regs[B][C] = regs[A]` |
+| 72 | GetIdxIc         | ABC    | Keyed get with IC slot C, result in regs[A] |
+| 73 | SetIdxIc         | ABC    | Keyed set with IC slot C, store regs[A] |
+| 74 | GetGlobal        | ABx    | Slow global load into regs[A] |
+| 75 | SetGlobal        | ABx    | Slow global store from regs[A] |
+| 76 | GetUpval         | AB     | Get upvalue at index B into regs[A] |
+| 77 | SetUpval         | AB     | Set upvalue at index B to regs[A] |
+| 78 | GetScope         | AB     | Get lexical scope at depth B into regs[A] |
+| 79 | SetScope         | AB     | Set lexical scope at depth B to regs[A] |
+| 80 | ResolveScope     | ABx    | Resolve identifier Bx → environment in regs[A] |
+| 81 | GetSuper         | ABC    | Super property get into regs[A] |
+| 82 | SetSuper         | ABC    | Super property set with regs[A] |
+| 83 | DeleteProp       | ABC    | `regs[A] = delete regs[B][C]` |
+| 84 | HasProp          | ABC    | `regs[A] = (C in regs[B])` |
+| 85 | Keys             | AB     | `regs[A] = Object.keys(regs[B])` |
+| 86 | ForIn            | AB     | Prepare for‑in: iterator in regs[A], first key in acc |
+| 87 | IteratorNext     | A      | Get next value from iterator in regs[A], result in acc |
+| 88 | Spread           | AB     | Spread elements from array regs[B] into array regs[A] |
+| 89 | Destructure      | AB     | Destructure from source regs[B] into registers starting at A |
+| 90 | CreateEnv        | A      | Create lexical environment, store in regs[A] |
+| 91 | LoadName         | ABx    | Load variable by identifier constant Bx using scope, result in acc |
+| 92 | StoreName        | ABx    | Store regs[A] into variable named by identifier constant Bx |
+| 93 | LoadClosure      | AB     | Load captured value from closure at index B into regs[A] |
+| 94 | NewThis          | A      | Allocate this object for constructor, store in regs[A] |
+| 95 | TypeofName       | ABx    | `regs[A] = interned_string(typeof variable named Bx)` (no ReferenceError) |
 
 ### 3.4 Control Flow (96–127)
 
 | Op | Mnemonic         | Format | Description |
 |----|------------------|--------|-------------|
-| 96 | jmp_eq           | ABC    | Jump if `regs[A] == regs[B]` |
-| 97 | jmp_neq          | ABC    | Jump if `regs[A] != regs[B]` |
-| 98 | jmp_lt           | ABC    | Jump if `regs[A] < regs[B]` |
-| 99 | jmp_lte          | ABC    | Jump if `regs[A] <= regs[B]` |
-| 100| loop_inc_jmp     | AsBx   | Increment `regs[A]`, jump if still < bound (used in for‑loops) |
-| 101| switch           | AB     | Jump table dispatch (B = table index) |
-| 102| loop_hint        | –      | Hint for OSR |
-| 103| ret              | –      | Return accumulator to caller |
-| 104| ret_u            | –      | Return undefined |
-| 105| tail_call        | A B    | Tail call (reuse current frame) |
-| 106| construct        | A B    | Constructor call |
-| 107| call_var         | A      | Call with spread (args in array at regs[A+1]) |
-| 108| enter            | uBx    | Allocate frame of size uBx |
-| 109| leave            | –      | Destroy frame |
-| 110| yield            | A      | Generator yield (value in regs[A]) |
-| 111| await            | A      | Async await |
-| 112| throw            | A      | Throw `regs[A]` |
-| 113| try              | sBx    | Start try (jump to catch) |
-| 114| end_try          | –      | End try |
-| 115| catch            | A      | Catch handler (store exception in regs[A]) |
-| 116| finally          | –      | Finally block start |
-| 117–127| reserved     |        | |
+| 96 | JmpEq            | ABC    | Jump if `regs[A] == regs[B]` |
+| 97 | JmpNeq           | ABC    | Jump if `regs[A] != regs[B]` |
+| 98 | JmpLt            | ABC    | Jump if `regs[A] < regs[B]` |
+| 99 | JmpLte           | ABC    | Jump if `regs[A] <= regs[B]` |
+| 100| LoopIncJmp       | AsBx   | Increment `regs[A]`, jump if still < bound (used in for‑loops) |
+| 101| Switch           | AB     | Jump table dispatch (B = table index) |
+| 102| LoopHint         | –      | Hint for OSR |
+| 103| Ret              | –      | Return accumulator to caller |
+| 104| RetU             | –      | Return undefined |
+| 105| TailCall         | A B    | Tail call (reuse current frame) |
+| 106| Construct        | A B    | Constructor call |
+| 107| CallVar          | A      | Call with spread (args in array at regs[A+1]) |
+| 108| Enter            | uBx    | Allocate frame of size uBx |
+| 109| Leave            | –      | Destroy frame |
+| 110| Yield            | A      | Generator yield (value in regs[A]) |
+| 111| Await            | A      | Async await |
+| 112| Throw            | A      | Throw `regs[A]` |
+| 113| Try              | sBx    | Start try (jump to catch) |
+| 114| EndTry           | –      | End try |
+| 115| Catch            | A      | Catch handler (store exception in regs[A]) |
+| 116| Finally          | –      | Finally block start |
+| 117| Pow              | BC     | `acc = regs[B] ** regs[C]` (exponentiation) |
+| 118| LogicalAnd       | BC     | `acc = regs[B] && regs[C]` (logical AND) |
+| 119| LogicalOr        | BC     | `acc = regs[B] || regs[C]` (logical OR) |
+| 120| NullishCoalesce  | BC     | `acc = regs[B] ?? regs[C]` (nullish coalescing) |
+| 121| In               | BC     | `acc = regs[C] in regs[B]` (in operator) |
+| 122| Instanceof       | BC     | `acc = regs[B] instanceof regs[C]` (instanceof operator) |
+| 123| reserved         |        | |
+| 124| reserved         |        | |
+| 125| reserved         |        | |
+| 126| reserved         |        | |
+| 127| reserved         |        | |
 
 ### 3.5 Call & Return (128–159)
 
 | Op | Mnemonic         | Format | Description |
 |----|------------------|--------|-------------|
-| 128| call_ic          | A B    | Call with IC (method call) |
-| 129| call_ic_var      | A      | Spread call with IC |
-| 130–159| reserved     |        | |
+| 128| CallIc           | A B    | Call with IC (method call) |
+| 129| CallIcVar        | A      | Spread call with IC |
+| 130| AddI32Fast       | BC     | Fast 32-bit integer addition: `acc = regs[B] + regs[C]` |
+| 131| AddF64Fast       | BC     | Fast 64-bit float addition: `acc = regs[B] + regs[C]` |
+| 132| SubI32Fast       | BC     | Fast 32-bit integer subtraction: `acc = regs[B] - regs[C]` |
+| 133| MulI32Fast       | BC     | Fast 32-bit integer multiplication: `acc = regs[B] * regs[C]` |
+| 134| EqI32Fast        | BC     | Fast 32-bit integer equality: `acc = (regs[B] == regs[C])` |
+| 135| LtI32Fast        | BC     | Fast 32-bit integer less than: `acc = (regs[B] < regs[C])` |
+| 136| JmpI32Fast       | AsBx   | Fast jump based on 32-bit integer condition |
+| 137| GetPropMono      | ABC    | Monomorphic property get with IC slot C |
+| 138| CallMono         | A B    | Monomorphic call with B arguments |
+| 139| Call0            | A      | Call function in regs[A] with 0 arguments |
+| 140| Call1            | AB     | Call function in regs[A] with 1 argument in regs[B] |
+| 141| Call2            | ABC    | Call function in regs[A] with 2 arguments in regs[B], regs[C] |
+| 142| Call3            | ABC    | Call function in regs[A] with 3 arguments in regs[B], regs[C], regs[D] |
+| 143| CallMethod1      | AB     | Call method with 1 argument: `acc = regs[A].method(regs[B])` |
+| 144| CallMethod2      | ABC    | Call method with 2 arguments: `acc = regs[A].method(regs[B], regs[C])` |
+| 145| GetPropCall      | AB     | Get property and call: `acc = regs[A][B]()` |
+| 146| CallRet          | A      | Call and return result: `acc = regs[A]()` |
+| 147| AssertValue      | A      | Assert that regs[A] is truthy |
+| 148| AssertOk         | –      | Assert success (no-op in production) |
+| 149| AssertFail       | –      | Assert failure (throws in debug mode) |
+| 150| AssertThrows     | A      | Assert that calling regs[A] throws |
+| 151| AssertDoesNotThrow | A    | Assert that calling regs[A] does not throw |
+| 152| AssertRejects    | A      | Assert that promise in regs[A] rejects |
+| 153| AssertDoesNotReject | A  | Assert that promise in regs[A] does not reject |
+| 154| AssertEqual      | BC     | Assert that `regs[B] == regs[C]` |
+| 155| AssertNotEqual   | BC     | Assert that `regs[B] != regs[C]` |
+| 156| AssertDeepEqual  | BC     | Assert deep equality of regs[B] and regs[C] |
+| 157| AssertNotDeepEqual | BC  | Assert not deep equal of regs[B] and regs[C] |
+| 158| AssertStrictEqual | BC   | Assert that `regs[B] === regs[C]` |
+| 159| AssertNotStrictEqual | BC | Assert that `regs[B] !== regs[C]` |
 
 ### 3.6 Profiling / OSR / Feedback (160–199)
 
 | Op | Mnemonic         | Format | Description |
 |----|------------------|--------|-------------|
-| 160| profile_type     | BC     | Record type of register B in slot C |
-| 161| profile_call     | BC     | Record call target B in slot C |
-| 162| profile_ret      | –      | Profile return |
-| 163| check_type       | BC     | Deopt if type of B not expected |
-| 164| check_struct     | BC     | Deopt if structure ID mismatch |
-| 165| check_ic         | BC     | Verify IC slot C for object B |
-| 166| ic_init          | AB     | Initialize IC slot A with struct of B |
-| 167| ic_update        | AB     | Update IC slot A to new struct |
-| 168| ic_miss          | A      | Handle IC miss |
-| 169| osr_entry        | –      | OSR entry point |
-| 170| profile_hot_loop | –      | Record loop hotness |
-| 171| osr_exit         | –      | Deoptimize to interpreter |
-| 172| jit_hint         | A      | Hint for JIT |
-| 173| safety_check     | A      | Runtime safety |
-| 174–199| reserved     |        | |
+| 160| ProfileType      | BC     | Record type of register B in slot C |
+| 161| ProfileCall      | BC     | Record call target B in slot C |
+| 162| ProfileRet       | –      | Profile return |
+| 163| CheckType        | BC     | Deopt if type of B not expected |
+| 164| CheckStruct      | BC     | Deopt if structure ID mismatch |
+| 165| CheckIc          | BC     | Verify IC slot C for object B |
+| 166| IcInit           | AB     | Initialize IC slot A with struct of B |
+| 167| IcUpdate         | AB     | Update IC slot A to new struct |
+| 168| IcMiss           | A      | Handle IC miss |
+| 169| OsrEntry         | –      | OSR entry point |
+| 170| ProfileHotLoop   | –      | Record loop hotness |
+| 171| OsrExit          | –      | Deoptimize to interpreter |
+| 172| JitHint          | A      | Hint for JIT |
+| 173| SafetyCheck      | A      | Runtime safety |
+| 174| AssertDeepStrictEqual | BC | Assert deep strict equality of regs[B] and regs[C] |
+| 175| AssertNotDeepStrictEqual | BC | Assert not deep strict equal of regs[B] and regs[C] |
+| 176| LoadAdd          | ABC    | Load and add: `regs[A] = regs[B] + regs[C]` |
+| 177| LoadSub          | ABC    | Load and subtract: `regs[A] = regs[B] - regs[C]` |
+| 178| LoadMul          | ABC    | Load and multiply: `regs[A] = regs[B] * regs[C]` |
+| 179| LoadInc          | ABC    | Load and increment: `regs[A] = regs[B] + 1` |
+| 180| LoadDec          | ABC    | Load and decrement: `regs[A] = regs[B] - 1` |
+| 181| LoadCmpEq        | ABC    | Load and compare equality: `regs[A] = (regs[B] == regs[C])` |
+| 182| LoadCmpLt        | ABC    | Load and compare less than: `regs[A] = (regs[B] < regs[C])` |
+| 183| LoadJfalse       | AsBx   | Load and jump if false: if not `regs[A]`, jump by sBx |
+| 184| LoadCmpEqJfalse  | ABC    | Load, compare equality, and jump if false |
+| 185| LoadCmpLtJfalse  | ABC    | Load, compare less than, and jump if false |
+| 186| LoadGetProp      | ABC    | Load and get property: `regs[A] = regs[B][C]` |
+| 187| LoadGetPropCmpEq | ABC    | Load, get property, and compare equality |
+| 188| GetProp2Ic       | ABC    | Get property with 2-level IC chain |
+| 189| GetProp3Ic       | ABC    | Get property with 3-level IC chain |
+| 190| GetElem          | ABC    | Get element: `regs[A] = regs[B][regs[C]]` |
+| 191| SetElem          | ABC    | Set element: `regs[B][regs[C]] = regs[A]` |
+| 192| GetPropElem      | ABC    | Get property element: `regs[A] = regs[B][C][D]` |
+| 193| CallMethodIc     | ABC    | Call method with IC: `acc = regs[A].method(regs[B], regs[C])` |
+| 194| CallMethod2Ic    | ABC    | Call method with 2-level IC |
+| 195| reserved         |        | |
+| 196| reserved         |        | |
+| 197| reserved         |        | |
+| 198| reserved         |        | |
+| 199| reserved         |        | |
 
 ### 3.7 Superinstructions (200–255)
 
 | Op | Mnemonic                     | Format | Fused Instructions |
 |----|------------------------------|--------|---------------------|
-| 200| get_prop_ic_call             | ABC    | `get_prop_ic + call` |
-| 201| inc_jmp_false_loop           | AsBx   | `inc_acc + jmp_false` |
-| 202| load_k_add_acc               | Bx     | `load_k + add_acc` |
-| 203| add_mov                      | ABC    | `add + mov` |
-| 204| eq_jmp_true                  | BC sBx | `eq + jmp_true` |
-| 205| get_prop_acc_call            | BC     | `get_prop_acc + call` |
-| 206| load_k_mul_acc               | Bx     | `load_k + mul_acc` |
-| 207| lt_jmp                       | BC sBx | `lt + jmp` |
-| 208| get_prop_ic_mov              | ABC    | `get_prop_ic + mov` |
-| 209| get_prop_add_imm_set_prop_ic | AB C   | `get_prop_ic + add_acc_imm8 + set_prop_ic` |
-| 210| add_acc_imm8_mov             | B A    | `add_acc_imm8 + mov` |
-| 211| call_ic                      | A B    | `get_prop_ic + call` (monomorphic) |
-| 212| load_this_call               | B      | `load_this + call` |
-| 213| eq_jmp_false                 | BC sBx | `eq + jmp_false` |
-| 214| load_k_sub_acc               | Bx     | `load_k + sub_acc` |
-| 215| get_length_ic_call           | B      | `get_length_ic + call` |
-| 216| add_str_acc_mov              | B A    | `add_str_acc + mov` |
-| 217| inc_acc_jmp                  | sBx    | `inc_acc + jmp` |
-| 218| get_prop_chain_acc           | B C    | `get_prop_acc + get_prop_acc` (chained: `acc = regs[regs[B]][C]`) |
-| 219| test_jmp_true                | A sBx  | `test + jmp_true` |
-| 220| load_arg_call                | A B    | `load_arg + call` |
-| 221| mul_acc_mov                  | B A    | `mul_acc + mov` |
-| 222| lte_jmp_loop                 | BC sBx | `lte + jmp` |
-| 223| new_obj_init_prop            | ABC    | `new_obj + init_prop` |
-| 224| profile_hot_call             | B C    | `call + profile_call` |
-| 225–255| reserved                 |        | |
+| 200| GetPropIcCall                | ABC    | `GetPropIc + Call` |
+| 201| IncJmpFalseLoop              | AsBx   | `IncAcc + JmpFalse` |
+| 202| LoadKAddAcc                  | Bx     | `LoadK + AddAcc` |
+| 203| AddMov                       | ABC    | `Add + Mov` |
+| 204| EqJmpTrue                    | BC sBx | `Eq + JmpTrue` |
+| 205| GetPropAccCall               | BC     | `GetPropAcc + Call` |
+| 206| LoadKMulAcc                  | Bx     | `LoadK + MulAcc` |
+| 207| LtJmp                        | BC sBx | `Lt + Jmp` |
+| 208| GetPropIcMov                 | ABC    | `GetPropIc + Mov` |
+| 209| GetPropAddImmSetPropIc       | AB C   | `GetPropIc + AddAccImm8 + SetPropIc` |
+| 210| AddAccImm8Mov                | B A    | `AddAccImm8 + Mov` |
+| 211| CallIcSuper                  | A B    | `GetPropIc + Call` (monomorphic) |
+| 212| LoadThisCall                 | B      | `LoadThis + Call` |
+| 213| EqJmpFalse                   | BC sBx | `Eq + JmpFalse` |
+| 214| LoadKSubAcc                  | Bx     | `LoadK + SubAcc` |
+| 215| GetLengthIcCall              | B      | `GetLengthIc + Call` |
+| 216| AddStrAccMov                 | B A    | `AddStrAcc + Mov` |
+| 217| IncAccJmp                    | sBx    | `IncAcc + Jmp` |
+| 218| GetPropChainAcc              | B C    | `GetPropAcc + GetPropAcc` (chained: `acc = regs[regs[B]][C]`) |
+| 219| TestJmpTrue                  | A sBx  | `Test + JmpTrue` |
+| 220| LoadArgCall                  | A B    | `LoadArg + Call` |
+| 221| MulAccMov                    | B A    | `MulAcc + Mov` |
+| 222| LteJmpLoop                   | BC sBx | `Lte + Jmp` |
+| 223| NewObjInitProp               | ABC    | `NewObj + InitProp` |
+| 224| ProfileHotCall               | B C    | `Call + ProfileCall` |
+| 225| Call1SubI                    | ABC    | `Call1 + SubI` |
+| 226| JmpLteFalse                  | ABC    | `Jmp + Lte + False` |
+| 227| RetReg                       | A      | `Ret + Reg` |
+| 228| AddI32                       | ABC    | `Add + I32` |
+| 229| AddF64                       | ABC    | `Add + F64` |
+| 230| SubI32                       | ABC    | `Sub + I32` |
+| 231| SubF64                       | ABC    | `Sub + F64` |
+| 232| MulI32                       | ABC    | `Mul + I32` |
+| 233| MulF64                       | ABC    | `Mul + F64` |
+| 234| RetIfLteI                    | ABC    | `Ret + If + Lte + I` |
+| 235| AddAccReg                    | AB     | `AddAcc + Reg` |
+| 236| Call1Add                     | ABC    | `Call1 + Add` |
+| 237| Call2Add                     | ABC    | `Call2 + Add` |
+| 238| LoadKAdd                     | ABx    | `LoadK + Add` |
+| 239| LoadKCmp                     | ABx    | `LoadK + Cmp` |
+| 240| CmpJmp                       | ABC    | `Cmp + Jmp` |
+| 241| reserved                     |        | |
+| 242| reserved                     |        | |
+| 243| reserved                     |        | |
+| 244| reserved                     |        | |
+| 245| reserved                     |        | |
+| 246| reserved                     |        | |
+| 247| reserved                     |        | |
+| 248| reserved                     |        | |
+| 249| reserved                     |        | |
+| 250| reserved                     |        | |
+| 251| reserved                     |        | |
+| 252| reserved                     |        | |
+| 253| reserved                     |        | |
+| 254| reserved                     |        | |
+| 255| reserved                     |        | |
 
 ---
 

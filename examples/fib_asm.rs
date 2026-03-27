@@ -36,7 +36,6 @@
 
 use vm::asm::*;
 use vm::emit::BytecodeBuilder;
-use vm::js_value::*;
 
 fn main() {
     println!("=== Fibonacci Assembly Test ===\n");

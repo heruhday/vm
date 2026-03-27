@@ -335,6 +335,11 @@ impl BytecodeBuilder {
         self.emit_raw(Opcode::ModI.as_u8(), dst, src, imm as u8);
     }
 
+    /// mod lhs, rhs (result in accumulator)
+    pub fn emit_mod(&mut self, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::Mod.as_u8(), 0, lhs, rhs);
+    }
+
     /// neg src (result in accumulator)
     pub fn emit_neg(&mut self, src: u8) {
         self.emit_raw(Opcode::Neg.as_u8(), 0, src, 0);
@@ -608,6 +613,11 @@ impl BytecodeBuilder {
     /// store_name src, name_id
     pub fn emit_store_name(&mut self, src: u8, name_id: u16) {
         self.emit_abx(Opcode::StoreName.as_u8(), src, name_id);
+    }
+
+    /// init_name src, name_id
+    pub fn emit_init_name(&mut self, src: u8, name_id: u16) {
+        self.emit_abx(Opcode::InitName.as_u8(), src, name_id);
     }
 
     /// load_closure dst, slot
@@ -939,6 +949,293 @@ impl BytecodeBuilder {
     /// profile_hot_call callee, arg_count
     pub fn emit_profile_hot_call(&mut self, callee: u8, arg_count: u8) {
         self.emit_raw(Opcode::ProfileHotCall.as_u8(), 0, callee, arg_count);
+    }
+
+    // ===== Late / Fused Instructions =====
+
+    /// add_i32 dst, lhs, rhs
+    pub fn emit_add_i32(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::AddI32.as_u8(), dst, lhs, rhs);
+    }
+
+    /// add_f64 dst, lhs, rhs
+    pub fn emit_add_f64(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::AddF64.as_u8(), dst, lhs, rhs);
+    }
+
+    /// sub_i32 dst, lhs, rhs
+    pub fn emit_sub_i32(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::SubI32.as_u8(), dst, lhs, rhs);
+    }
+
+    /// sub_f64 dst, lhs, rhs
+    pub fn emit_sub_f64(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::SubF64.as_u8(), dst, lhs, rhs);
+    }
+
+    /// mul_i32 dst, lhs, rhs
+    pub fn emit_mul_i32(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::MulI32.as_u8(), dst, lhs, rhs);
+    }
+
+    /// mul_f64 dst, lhs, rhs
+    pub fn emit_mul_f64(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::MulF64.as_u8(), dst, lhs, rhs);
+    }
+
+    /// ret_if_lte_i lhs, rhs, ret_reg
+    pub fn emit_ret_if_lte_i(&mut self, lhs: u8, rhs: u8, ret_reg: u8) {
+        self.emit_raw(Opcode::RetIfLteI.as_u8(), lhs, rhs, ret_reg);
+    }
+
+    /// add_acc_reg lhs, rhs
+    pub fn emit_add_acc_reg(&mut self, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::AddAccReg.as_u8(), lhs, rhs, 0);
+    }
+
+    /// call1_add callee, arg
+    pub fn emit_call1_add(&mut self, callee: u8, arg: u8) {
+        self.emit_raw(Opcode::Call1Add.as_u8(), callee, arg, 0);
+    }
+
+    /// call2_add callee, arg1, arg2
+    pub fn emit_call2_add(&mut self, callee: u8, arg1: u8, arg2: u8) {
+        self.emit_raw(Opcode::Call2Add.as_u8(), callee, arg1, arg2);
+    }
+
+    /// load_k_add dst, const_index
+    pub fn emit_load_k_add(&mut self, dst: u8, const_index: u16) {
+        self.emit_abx(Opcode::LoadKAdd.as_u8(), dst, const_index);
+    }
+
+    /// load_k_cmp reg, const_index
+    pub fn emit_load_k_cmp(&mut self, reg: u8, const_index: u16) {
+        self.emit_abx(Opcode::LoadKCmp.as_u8(), reg, const_index);
+    }
+
+    /// cmp_jmp lhs, rhs, offset
+    pub fn emit_cmp_jmp(&mut self, lhs: u8, rhs: u8, offset: i8) {
+        self.emit_raw(Opcode::CmpJmp.as_u8(), lhs, rhs, offset as u8);
+    }
+
+    /// get_prop_call dst, obj, key
+    pub fn emit_get_prop_call(&mut self, dst: u8, obj: u8, key: u8) {
+        self.emit_raw(Opcode::GetPropCall.as_u8(), dst, obj, key);
+    }
+
+    /// call_ret callee, arg_count
+    pub fn emit_call_ret(&mut self, callee: u8, arg_count: u8) {
+        self.emit_raw(Opcode::CallRet.as_u8(), callee, arg_count, 0);
+    }
+
+    // ===== Specialized Instructions =====
+
+    /// add_i32_fast dst, lhs, rhs
+    pub fn emit_add_i32_fast(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::AddI32Fast.as_u8(), dst, lhs, rhs);
+    }
+
+    /// add_f64_fast dst, lhs, rhs
+    pub fn emit_add_f64_fast(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::AddF64Fast.as_u8(), dst, lhs, rhs);
+    }
+
+    /// sub_i32_fast dst, lhs, rhs
+    pub fn emit_sub_i32_fast(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::SubI32Fast.as_u8(), dst, lhs, rhs);
+    }
+
+    /// mul_i32_fast dst, lhs, rhs
+    pub fn emit_mul_i32_fast(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::MulI32Fast.as_u8(), dst, lhs, rhs);
+    }
+
+    /// eq_i32_fast lhs, rhs
+    pub fn emit_eq_i32_fast(&mut self, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::EqI32Fast.as_u8(), 0, lhs, rhs);
+    }
+
+    /// lt_i32_fast lhs, rhs
+    pub fn emit_lt_i32_fast(&mut self, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::LtI32Fast.as_u8(), 0, lhs, rhs);
+    }
+
+    /// jmp_i32_fast lhs, rhs, offset
+    pub fn emit_jmp_i32_fast(&mut self, lhs: u8, rhs: u8, offset: i8) {
+        self.emit_raw(Opcode::JmpI32Fast.as_u8(), lhs, rhs, offset as u8);
+    }
+
+    /// get_prop_mono dst, obj, key
+    pub fn emit_get_prop_mono(&mut self, dst: u8, obj: u8, key: u8) {
+        self.emit_raw(Opcode::GetPropMono.as_u8(), dst, obj, key);
+    }
+
+    /// call_mono callee, arg_count
+    pub fn emit_call_mono(&mut self, callee: u8, arg_count: u8) {
+        self.emit_raw(Opcode::CallMono.as_u8(), callee, arg_count, 0);
+    }
+
+    /// call0 callee
+    pub fn emit_call0(&mut self, callee: u8) {
+        self.emit_raw(Opcode::Call0.as_u8(), callee, 0, 0);
+    }
+
+    /// call1 callee, arg
+    pub fn emit_call1(&mut self, callee: u8, arg: u8) {
+        self.emit_raw(Opcode::Call1.as_u8(), callee, arg, 0);
+    }
+
+    /// call2 callee, arg1, arg2
+    pub fn emit_call2(&mut self, callee: u8, arg1: u8, arg2: u8) {
+        self.emit_raw(Opcode::Call2.as_u8(), callee, arg1, arg2);
+    }
+
+    /// call3 callee, arg1, arg2, arg3
+    ///
+    /// The current VM encoding aliases the `A` field as both the callee register and arg3.
+    pub fn emit_call3(&mut self, callee: u8, arg1: u8, arg2: u8, arg3: u8) {
+        assert_eq!(
+            callee, arg3,
+            "Call3 encoding reuses the A field as both callee and arg3"
+        );
+        self.emit_raw(Opcode::Call3.as_u8(), callee, arg1, arg2);
+    }
+
+    /// call_method1 obj, slot
+    ///
+    /// Calls `reg[obj].slot(reg[obj + 1])`.
+    pub fn emit_call_method1(&mut self, obj: u8, slot: u16) {
+        self.emit_abx(Opcode::CallMethod1.as_u8(), obj, slot);
+    }
+
+    /// call_method2 obj, slot
+    ///
+    /// Calls `reg[obj].slot(reg[obj + 1], reg[obj + 2])`.
+    pub fn emit_call_method2(&mut self, obj: u8, slot: u16) {
+        self.emit_abx(Opcode::CallMethod2.as_u8(), obj, slot);
+    }
+
+    // ===== Arithmetic Superinstructions =====
+
+    /// load_add dst, lhs, rhs
+    pub fn emit_load_add(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::LoadAdd.as_u8(), dst, lhs, rhs);
+    }
+
+    /// load_sub dst, lhs, rhs
+    pub fn emit_load_sub(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::LoadSub.as_u8(), dst, lhs, rhs);
+    }
+
+    /// load_mul dst, lhs, rhs
+    pub fn emit_load_mul(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::LoadMul.as_u8(), dst, lhs, rhs);
+    }
+
+    /// load_inc dst, src
+    pub fn emit_load_inc(&mut self, dst: u8, src: u8) {
+        self.emit_raw(Opcode::LoadInc.as_u8(), dst, src, 0);
+    }
+
+    /// load_dec dst, src
+    pub fn emit_load_dec(&mut self, dst: u8, src: u8) {
+        self.emit_raw(Opcode::LoadDec.as_u8(), dst, src, 0);
+    }
+
+    // ===== Comparison Superinstructions =====
+
+    /// load_cmp_eq dst, lhs, rhs
+    pub fn emit_load_cmp_eq(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::LoadCmpEq.as_u8(), dst, lhs, rhs);
+    }
+
+    /// load_cmp_lt dst, lhs, rhs
+    pub fn emit_load_cmp_lt(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.emit_raw(Opcode::LoadCmpLt.as_u8(), dst, lhs, rhs);
+    }
+
+    /// load_jfalse reg, offset
+    pub fn emit_load_jfalse(&mut self, reg: u8, offset: i8) {
+        self.emit_raw(Opcode::LoadJfalse.as_u8(), reg, offset as u8, 0);
+    }
+
+    /// load_cmp_eq_jfalse lhs, rhs, offset
+    pub fn emit_load_cmp_eq_jfalse(&mut self, lhs: u8, rhs: u8, offset: i8) {
+        self.emit_raw(Opcode::LoadCmpEqJfalse.as_u8(), lhs, rhs, offset as u8);
+    }
+
+    /// load_cmp_lt_jfalse lhs, rhs, offset
+    pub fn emit_load_cmp_lt_jfalse(&mut self, lhs: u8, rhs: u8, offset: i8) {
+        self.emit_raw(Opcode::LoadCmpLtJfalse.as_u8(), lhs, rhs, offset as u8);
+    }
+
+    // ===== Property / Element Superinstructions =====
+
+    /// load_get_prop obj, key
+    pub fn emit_load_get_prop(&mut self, obj: u8, key: u8) {
+        self.emit_raw(Opcode::LoadGetProp.as_u8(), obj, key, 0);
+    }
+
+    /// load_get_prop_cmp_eq obj, key, rhs
+    pub fn emit_load_get_prop_cmp_eq(&mut self, obj: u8, key: u8, rhs: u8) {
+        self.emit_raw(Opcode::LoadGetPropCmpEq.as_u8(), obj, key, rhs);
+    }
+
+    /// get_prop2_ic dst, obj, slot1, slot2
+    ///
+    /// The current VM encoding aliases the `A` field as both `dst` and `slot2`.
+    pub fn emit_get_prop2_ic(&mut self, dst: u8, obj: u8, slot1: u8, slot2: u8) {
+        assert_eq!(
+            dst, slot2,
+            "GetProp2Ic encoding reuses the A field as both dst and slot2"
+        );
+        self.emit_raw(Opcode::GetProp2Ic.as_u8(), dst, obj, slot1);
+    }
+
+    /// get_prop3_ic dst, obj, slot1, slot2, slot3
+    ///
+    /// The current VM encoding aliases `A` as `dst/slot2` and `B` as `obj/slot3`.
+    pub fn emit_get_prop3_ic(&mut self, dst: u8, obj: u8, slot1: u8, slot2: u8, slot3: u8) {
+        assert_eq!(
+            dst, slot2,
+            "GetProp3Ic encoding reuses the A field as both dst and slot2"
+        );
+        assert_eq!(
+            obj, slot3,
+            "GetProp3Ic encoding reuses the B field as both obj and slot3"
+        );
+        self.emit_raw(Opcode::GetProp3Ic.as_u8(), dst, obj, slot1);
+    }
+
+    /// get_elem dst, obj, index
+    pub fn emit_get_elem(&mut self, dst: u8, obj: u8, index: u8) {
+        self.emit_raw(Opcode::GetElem.as_u8(), dst, obj, index);
+    }
+
+    /// set_elem value, obj, index
+    pub fn emit_set_elem(&mut self, value: u8, obj: u8, index: u8) {
+        self.emit_raw(Opcode::SetElem.as_u8(), value, obj, index);
+    }
+
+    /// get_prop_elem dst, obj, slot, index
+    ///
+    /// The current VM encoding aliases the `A` field as both `dst` and `index`.
+    pub fn emit_get_prop_elem(&mut self, dst: u8, obj: u8, slot: u8, index: u8) {
+        assert_eq!(
+            dst, index,
+            "GetPropElem encoding reuses the A field as both dst and index"
+        );
+        self.emit_raw(Opcode::GetPropElem.as_u8(), dst, obj, slot);
+    }
+
+    /// call_method_ic obj, slot
+    pub fn emit_call_method_ic(&mut self, obj: u8, slot: u8) {
+        self.emit_raw(Opcode::CallMethodIc.as_u8(), obj, slot, 0);
+    }
+
+    /// call_method2_ic obj, slot1, slot2
+    pub fn emit_call_method2_ic(&mut self, obj: u8, slot1: u8, slot2: u8) {
+        self.emit_raw(Opcode::CallMethod2Ic.as_u8(), obj, slot1, slot2);
     }
 
     // ===== Assertion Instructions =====

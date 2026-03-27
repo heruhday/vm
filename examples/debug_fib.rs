@@ -1,6 +1,4 @@
 use vm::emit::BytecodeBuilder;
-use vm::js_value::*;
-use vm::vm::VM;
 
 fn main() {
     println!("=== Debug Fibonacci Computation ===\n");

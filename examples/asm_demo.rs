@@ -1,5 +1,7 @@
 //! Example demonstrating assembly code generation for QJL bytecode
 
+use std::f64::consts::PI;
+
 use vm::asm::*;
 use vm::js_value::*;
 
@@ -7,7 +9,7 @@ fn main() {
     println!("=== QJL Bytecode Assembly Demo ===\n");
 
     // Create some constants (just numbers for simplicity)
-    let constants = vec![make_number(42.0), make_number(3.14), make_number(100.0)];
+    let constants = vec![make_number(42.0), make_number(PI), make_number(100.0)];
 
     // Create some bytecode instructions
     let bytecode = vec![

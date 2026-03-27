@@ -6,6 +6,12 @@ use crate::gc::{Gc, *};
 use crate::heap::*;
 use crate::runtime::Context;
 use crate::runtime_trait::*;
+pub mod json;
+pub mod msgpack;
+pub mod serde_bridge;
+pub mod tag_offset_arena_buffer;
+pub mod yaml;
+pub use self::tag_offset_arena_buffer::ValueError;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Value(pub(crate) u64);
@@ -230,31 +236,6 @@ impl std::fmt::Display for SerdeValueError {
 }
 
 impl std::error::Error for SerdeValueError {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ValueError {
-    message: String,
-}
-
-impl ValueError {
-    fn unsupported(feature: &'static str) -> Self {
-        Self {
-            message: format!("{feature} support is not available in this register-vm build"),
-        }
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl std::fmt::Display for ValueError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for ValueError {}
 
 const QNAN: u64 = 0x7ffc_0000_0000_0000;
 const TAG_MASK: u64 = 0xf;
@@ -650,77 +631,66 @@ impl Value {
         }
     }
 
-    pub fn from_json(_ctx: &Context, _json: &str) -> Result<Self, JsonValueError> {
-        Err(JsonValueError::parse(
-            "JSON support is not available in this register-vm build",
-        ))
+    pub fn from_json(ctx: &Context, json: &str) -> Result<Self, JsonValueError> {
+        json::from_json(ctx, json)
     }
 
-    pub fn from_serde<T>(_ctx: &Context, _value: &T) -> Result<Self, SerdeValueError> {
-        Err(SerdeValueError::unsupported("serde"))
+    pub fn from_serde<T: serde::Serialize>(
+        ctx: &Context,
+        value: &T,
+    ) -> Result<Self, SerdeValueError> {
+        serde_bridge::from_serde(ctx, value)
     }
 
-    pub fn from_serde_json<T>(_ctx: &Context, _value: &T) -> Self {
-        Self::undefined()
+    pub fn from_serde_json<T: serde::Serialize>(ctx: &Context, value: &T) -> Self {
+        match serde_json::to_value(value) {
+            Ok(value) => serde_bridge::from_serde_json(ctx, &value),
+            Err(_) => Self::undefined(),
+        }
     }
 
-    pub fn to_json(self, _ctx: &Context) -> Result<String, JsonValueError> {
-        let _ = self;
-        Err(JsonValueError::parse(
-            "JSON support is not available in this register-vm build",
-        ))
+    pub fn to_json(self, ctx: &Context) -> Result<String, JsonValueError> {
+        json::to_json(ctx, self)
     }
 
-    pub fn to_serde<T>(self, _ctx: &Context) -> Result<T, SerdeValueError> {
-        let _ = self;
-        Err(SerdeValueError::unsupported("serde"))
+    pub fn to_serde<T: serde::de::DeserializeOwned>(
+        self,
+        ctx: &Context,
+    ) -> Result<T, SerdeValueError> {
+        serde_bridge::to_serde(ctx, self)
     }
 
-    pub fn to_serde_json(self, _ctx: &Context) -> Result<String, SerdeValueError> {
-        let _ = self;
-        Err(SerdeValueError::unsupported("serde_json"))
+    pub fn to_serde_json(self, ctx: &Context) -> Result<String, SerdeValueError> {
+        let value = serde_bridge::to_serde_json(ctx, self)?;
+        serde_json::to_string(&value).map_err(SerdeValueError::serde_json)
     }
 
-    pub fn to_pretty_json(self, _ctx: &Context) -> Result<String, JsonValueError> {
-        let _ = self;
-        Err(JsonValueError::parse(
-            "JSON support is not available in this register-vm build",
-        ))
+    pub fn to_pretty_json(self, ctx: &Context) -> Result<String, JsonValueError> {
+        json::to_pretty_json(ctx, self)
     }
 
-    pub fn from_yaml(_ctx: &Context, _yaml: &str) -> Result<Self, YamlValueError> {
-        Err(YamlValueError::parse(
-            "YAML support is not available in this register-vm build",
-        ))
+    pub fn from_yaml(ctx: &Context, yaml: &str) -> Result<Self, YamlValueError> {
+        yaml::from_yaml(ctx, yaml)
     }
 
-    pub fn to_yaml(self, _ctx: &Context) -> Result<String, YamlValueError> {
-        let _ = self;
-        Err(YamlValueError::parse(
-            "YAML support is not available in this register-vm build",
-        ))
+    pub fn to_yaml(self, ctx: &Context) -> Result<String, YamlValueError> {
+        yaml::to_yaml(ctx, self)
     }
 
-    pub fn from_msgpack(_ctx: &Context, _bytes: &[u8]) -> Result<Self, MsgpackValueError> {
-        Err(MsgpackValueError::parse(
-            "MsgPack support is not available in this register-vm build",
-        ))
+    pub fn from_msgpack(ctx: &Context, bytes: &[u8]) -> Result<Self, MsgpackValueError> {
+        msgpack::from_msgpack(ctx, bytes)
     }
 
-    pub fn to_msgpack(self, _ctx: &Context) -> Result<Vec<u8>, MsgpackValueError> {
-        let _ = self;
-        Err(MsgpackValueError::parse(
-            "MsgPack support is not available in this register-vm build",
-        ))
+    pub fn to_msgpack(self, ctx: &Context) -> Result<Vec<u8>, MsgpackValueError> {
+        msgpack::to_msgpack(ctx, self)
     }
 
-    pub fn from_arena_buffer(_ctx: &Context, _bytes: &[u8]) -> Result<Self, ValueError> {
-        Err(ValueError::unsupported("arena buffer"))
+    pub fn from_arena_buffer(ctx: &Context, bytes: &[u8]) -> Result<Self, ValueError> {
+        tag_offset_arena_buffer::from_arena_buffer(ctx, bytes)
     }
 
-    pub fn to_arena_buffer(self, _ctx: &Context) -> Result<Vec<u8>, ValueError> {
-        let _ = self;
-        Err(ValueError::unsupported("arena buffer"))
+    pub fn to_arena_buffer(self, ctx: &Context) -> Result<Vec<u8>, ValueError> {
+        tag_offset_arena_buffer::to_arena_buffer(ctx, self)
     }
 }
 

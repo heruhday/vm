@@ -28,11 +28,11 @@ fn mandelbrot_program_disassembles_to_expected_shape() {
     let asm = disassemble_clean(&bytecode, &constants);
 
     assert_eq!(asm.len(), 44);
-    assert_eq!(asm[0], "loadk r1, const[0]");
-    assert_eq!(asm[1], "loadk r2, const[1]");
-    assert!(asm.iter().any(|line| line == "mulacc r3"));
-    assert!(asm.iter().any(|line| line == "mulacc r4"));
-    assert!(asm.iter().any(|line| line == "subacc r8"));
+    assert_eq!(asm[0], "load_k r1, const[0]");
+    assert_eq!(asm[1], "load_k r2, const[1]");
+    assert!(asm.iter().any(|line| line == "mul_acc r3"));
+    assert!(asm.iter().any(|line| line == "mul_acc r4"));
+    assert!(asm.iter().any(|line| line == "sub_acc r8"));
     assert_eq!(asm[41], "jmp -> L-31");
     assert_eq!(asm[43], "ret");
 }

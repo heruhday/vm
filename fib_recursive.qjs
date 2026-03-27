@@ -17,8 +17,8 @@ const end = Date.now();
 
 // compute average per run in microseconds
 const totalMs = end - start;
-const avgUs = (totalMs * 1000) / runs;
+const avgUs = totalMs / runs;
 
 console.log("fib(25) =", result);
 console.log("Total time:", totalMs, "ms");
-console.log("Avg per run:", avgUs.toFixed(4), "us");
+console.log("Avg per run:", avgUs, "ms");

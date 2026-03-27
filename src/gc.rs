@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::cell::{Ref, RefCell, RefMut};
 use std::rc::Rc;
 
@@ -12,9 +13,10 @@ pub struct CollectStats {
     pub collected: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct GC {
     allocated: usize,
+    objects: Vec<Rc<dyn Any>>,
 }
 
 impl GC {
@@ -63,7 +65,7 @@ pub struct Gc<T> {
     pub(crate) inner: Rc<GcBox<T>>,
 }
 
-impl<T: HeapTyped> Gc<T> {
+impl<T: HeapTyped + 'static> Gc<T> {
     pub fn new(gc: &mut GC, value: T) -> Self {
         gc.allocated += 1;
         let obj_type = match T::KIND {
@@ -71,12 +73,13 @@ impl<T: HeapTyped> Gc<T> {
             _ => ObjType::Object,
         };
 
-        Self {
-            inner: Rc::new(GcBox {
-                header: GCHeader::with_kind(obj_type, T::KIND),
-                value: RefCell::new(value),
-            }),
-        }
+        let inner = Rc::new(GcBox {
+            header: GCHeader::with_kind(obj_type, T::KIND),
+            value: RefCell::new(value),
+        });
+        gc.objects.push(inner.clone() as Rc<dyn Any>);
+
+        Self { inner }
     }
 
     pub fn borrow(&self) -> Ref<'_, T> {

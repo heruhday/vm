@@ -35,6 +35,7 @@ fn main() {
     builder2.emit_mov(3, 255); // mov r3, accumulator (i = 1)
 
     // Loop start:
+    let loop_start = builder2.len();
     builder2.emit_lte(3, 1); // lte r3, r1 (i <= n)
     builder2.emit_jmp_false(255, 6); // jmp_false accumulator, +6 (exit loop)
 
@@ -43,10 +44,12 @@ fn main() {
     builder2.emit_mov(2, 255); // mov r2, accumulator (sum = accumulator)
 
     // i = i + 1
-    builder2.emit_add_acc(3); // add_acc r3 (accumulator = i + 1)
+    builder2.emit_mov(255, 3); // mov accumulator, r3 (accumulator = i)
+    builder2.emit_inc_acc(); // accumulator = i + 1
     builder2.emit_mov(3, 255); // mov r3, accumulator (i = accumulator)
 
-    builder2.emit_jmp(-6); // jmp -6 (back to loop start)
+    let loop_back = -(builder2.len() as i16 - loop_start as i16 + 1);
+    builder2.emit_jmp(loop_back); // jump back to the loop condition
 
     // Return sum
     builder2.emit_mov(255, 2); // mov accumulator, r2

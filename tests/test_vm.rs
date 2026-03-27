@@ -295,7 +295,7 @@ fn public_leave_unwinds_scope_smoke() {
     builder.emit_enter(8);
     builder.emit_create_env(1);
     builder.emit_load_i(2, 7);
-    builder.emit_store_name(2, 11);
+    builder.emit_init_name(2, 11);
     builder.emit_leave();
     builder.emit_load_name(3, 11);
     builder.emit_ret();

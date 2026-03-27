@@ -14,22 +14,22 @@ function fib(n) {
 }
 
 // Run many times to amplify timing
-const runs = 100000;
+const runs = 100;
 
 const start = Date.now();
 
 let result;
 for (let i = 0; i < runs; i++) {
-  result = fib(49);
+  result = fib(25);
 }
 
 const end = Date.now();
 
 // compute average per run in microseconds
 const totalMs = end - start;
-const avgUs = (totalMs * 1000) / runs;
+const avgUs = totalMs / runs;
 
-console.log("fib(49) =", result);
+console.log("fib(25) =", result);
 console.log("Total time:", totalMs, "ms");
-console.log("Avg per run:", avgUs.toFixed(4), "us");
+console.log("Avg per run:", avgUs, "ms");
 

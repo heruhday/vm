@@ -1,20 +1,24 @@
 pub mod optimization;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, hash_map::Entry};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::atoms::{Atom, AtomTable, Shape as AtomShape};
-use crate::gc::{self, GCHeader, ObjType};
+use crate::gc::{self, GCHeader, Gc, ObjType};
 use crate::heap::{
     QArray, QBoolArray, QClass, QClosure, QFloat64Array, QFunction, QInstance, QInt32Array,
     QModule, QNativeClosure, QNativeFunction, QObject, QString, QStringArray, QSymbol, QUint8Array,
 };
 use crate::js_value::*;
+use crate::runtime::{CURRENT_JS_CONTEXT, Context, Runtime};
 use crate::runtime_trait::{
     ArithmeticOps, AssignmentOps, BitwiseOps, CallOps, CoercionOps, ComparisonOps,
     LogicalAssignOps, LogicalOps, NullishOps, PropertyOps, Ternary, TypeOps, ValueOps,
 };
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime};
 
 pub type JSString = QString;
 const ACC: usize = 255;
@@ -432,6 +436,33 @@ impl DerefMut for FrameStack {
     }
 }
 
+/// Type for threaded dispatch handler functions
+type DispatchHandler = fn(&mut VM, u32) -> ControlFlow;
+
+/// Control flow for threaded dispatch
+#[derive(Debug, Clone, Copy)]
+enum ControlFlow {
+    /// Continue to next instruction
+    Continue,
+    /// Stop execution
+    Stop,
+}
+
+fn with_bridge_context<R>(f: impl FnOnce(&Context) -> R) -> R {
+    let previous = CURRENT_JS_CONTEXT.with(|current| current.borrow().clone());
+    let runtime = Rc::new(RefCell::new(Runtime::new()));
+    let ctx = Context::new(runtime);
+    let result = f(&ctx);
+    CURRENT_JS_CONTEXT.with(|current| {
+        *current.borrow_mut() = previous;
+    });
+    result
+}
+
+fn builtin_native_stub(_ctx: &Context, _this: JSValue, _args: &[JSValue]) -> JSValue {
+    make_undefined()
+}
+
 #[derive(Debug)]
 pub struct VM {
     pub frame: FrameStack,
@@ -442,15 +473,25 @@ pub struct VM {
     pub shapes: Vec<*mut Shape>,
     pub strings: Vec<*mut JSString>,
     pub global_object: HashMap<u16, JSValue>,
+    pub console_output: Vec<String>,
     pub scope_chain: Vec<JSValue>,
     pub upvalues: Vec<JSValue>,
     pub last_exception: JSValue,
     pub(crate) interned_strings: HashMap<String, JSValue>,
+    compiled_properties: Vec<String>,
+    property_slots: HashMap<String, u16>,
     pub atoms: AtomTable,
     pub feedback: RuntimeFeedback,
     heap_shape: Rc<AtomShape>,
     next_shape_id: u32,
     last_ic_object: Option<*mut JSObject>,
+    console_timers: HashMap<String, Instant>,
+    console_counts: HashMap<String, usize>,
+    console_group_depth: usize,
+    console_echo: bool,
+
+    /// Dispatch table for threaded execution (hot opcodes only)
+    dispatch_table: [Option<DispatchHandler>; 256],
 }
 
 enum CallAction {
@@ -502,6 +543,7 @@ pub enum Opcode {
     MulI,
     DivI,
     ModI,
+    Mod,
     Neg,
     Inc,
     Dec,
@@ -557,6 +599,7 @@ pub enum Opcode {
     CreateEnv,
     LoadName,
     StoreName,
+    InitName,
     LoadClosure,
     NewThis,
     TypeofName,
@@ -622,21 +665,6 @@ pub enum Opcode {
     LteJmpLoop,
     NewObjInitProp,
     ProfileHotCall,
-    AssertValue,
-    AssertOk,
-    AssertEqual,
-    AssertNotEqual,
-    AssertDeepEqual,
-    AssertNotDeepEqual,
-    AssertStrictEqual,
-    AssertNotStrictEqual,
-    AssertDeepStrictEqual,
-    AssertNotDeepStrictEqual,
-    AssertThrows,
-    AssertDoesNotThrow,
-    AssertRejects,
-    AssertDoesNotReject,
-    AssertFail,
     Call1SubI,
     JmpLteFalse,
     RetReg,
@@ -646,6 +674,72 @@ pub enum Opcode {
     SubF64,
     MulI32,
     MulF64,
+    // Superinstructions
+    RetIfLteI,
+    AddAccReg,
+    Call1Add,
+    Call2Add,
+    LoadKAdd,
+    LoadKCmp,
+    CmpJmp,
+    GetPropCall,
+    CallRet,
+    // Specialized opcodes
+    AddI32Fast,
+    AddF64Fast,
+    SubI32Fast,
+    MulI32Fast,
+    EqI32Fast,
+    LtI32Fast,
+    JmpI32Fast,
+    GetPropMono,
+    CallMono,
+    // Call opcodes
+    Call0,
+    Call1,
+    Call2,
+    Call3,
+    CallMethod1,
+    CallMethod2,
+    // New arithmetic superinstructions
+    LoadAdd,
+    LoadSub,
+    LoadMul,
+    LoadInc,
+    LoadDec,
+    // New comparison superinstructions
+    LoadCmpEq,
+    LoadCmpLt,
+    LoadJfalse,
+    LoadCmpEqJfalse,
+    LoadCmpLtJfalse,
+    // Property access superinstructions
+    LoadGetProp,
+    LoadGetPropCmpEq,
+    // Pareto 80% property access superinstructions with IC
+    GetProp2Ic,
+    GetProp3Ic,
+    GetElem,
+    SetElem,
+    GetPropElem,
+    CallMethodIc,
+    CallMethod2Ic,
+    // Assertion opcodes
+    AssertValue,
+    AssertOk,
+    AssertFail,
+    AssertThrows,
+    AssertDoesNotThrow,
+    AssertRejects,
+    AssertDoesNotReject,
+    AssertEqual,
+    AssertNotEqual,
+    AssertDeepEqual,
+    AssertNotDeepEqual,
+    AssertStrictEqual,
+    AssertNotStrictEqual,
+    AssertDeepStrictEqual,
+    AssertNotDeepStrictEqual,
     Reserved(u8),
 }
 
@@ -693,6 +787,7 @@ impl From<u8> for Opcode {
             38 => Self::MulI,
             39 => Self::DivI,
             40 => Self::ModI,
+            61 => Self::Mod,
             41 => Self::Neg,
             42 => Self::Inc,
             43 => Self::Dec,
@@ -713,12 +808,6 @@ impl From<u8> for Opcode {
             58 => Self::Shl,
             59 => Self::Shr,
             60 => Self::Ushr,
-            117 => Self::Pow,
-            118 => Self::LogicalAnd,
-            119 => Self::LogicalOr,
-            120 => Self::NullishCoalesce,
-            121 => Self::In,
-            122 => Self::Instanceof,
             64 => Self::GetLengthIc,
             65 => Self::ArrayPushAcc,
             66 => Self::NewObj,
@@ -748,6 +837,7 @@ impl From<u8> for Opcode {
             90 => Self::CreateEnv,
             91 => Self::LoadName,
             92 => Self::StoreName,
+            123 => Self::InitName,
             93 => Self::LoadClosure,
             94 => Self::NewThis,
             95 => Self::TypeofName,
@@ -772,6 +862,12 @@ impl From<u8> for Opcode {
             114 => Self::EndTry,
             115 => Self::Catch,
             116 => Self::Finally,
+            117 => Self::Pow,
+            118 => Self::LogicalAnd,
+            119 => Self::LogicalOr,
+            120 => Self::NullishCoalesce,
+            121 => Self::In,
+            122 => Self::Instanceof,
             128 => Self::CallIc,
             129 => Self::CallIcVar,
             160 => Self::ProfileType,
@@ -813,21 +909,6 @@ impl From<u8> for Opcode {
             222 => Self::LteJmpLoop,
             223 => Self::NewObjInitProp,
             224 => Self::ProfileHotCall,
-            225 => Self::AssertValue,
-            226 => Self::AssertOk,
-            227 => Self::AssertEqual,
-            228 => Self::AssertNotEqual,
-            229 => Self::AssertDeepEqual,
-            230 => Self::AssertNotDeepEqual,
-            231 => Self::AssertStrictEqual,
-            232 => Self::AssertNotStrictEqual,
-            233 => Self::AssertDeepStrictEqual,
-            234 => Self::AssertNotDeepStrictEqual,
-            235 => Self::AssertThrows,
-            236 => Self::AssertDoesNotThrow,
-            237 => Self::AssertRejects,
-            238 => Self::AssertDoesNotReject,
-            239 => Self::AssertFail,
             240 => Self::Call1SubI,
             241 => Self::JmpLteFalse,
             242 => Self::RetReg,
@@ -837,6 +918,73 @@ impl From<u8> for Opcode {
             246 => Self::SubF64,
             247 => Self::MulI32,
             248 => Self::MulF64,
+            // Superinstructions
+            249 => Self::RetIfLteI,
+            250 => Self::AddAccReg,
+            251 => Self::Call1Add,
+            252 => Self::Call2Add,
+            253 => Self::LoadKAdd,
+            254 => Self::LoadKCmp,
+            255 => Self::CmpJmp,
+            // Specialized opcodes
+            130 => Self::AddI32Fast,
+            131 => Self::AddF64Fast,
+            132 => Self::SubI32Fast,
+            133 => Self::MulI32Fast,
+            134 => Self::EqI32Fast,
+            135 => Self::LtI32Fast,
+            136 => Self::JmpI32Fast,
+            137 => Self::GetPropMono,
+            138 => Self::CallMono,
+            // Call opcodes
+            139 => Self::Call0,
+            140 => Self::Call1,
+            141 => Self::Call2,
+            142 => Self::Call3,
+            143 => Self::CallMethod1,
+            144 => Self::CallMethod2,
+            // Superinstruction variants
+            145 => Self::GetPropCall,
+            146 => Self::CallRet,
+            // Assertion opcodes
+            147 => Self::AssertValue,
+            148 => Self::AssertOk,
+            149 => Self::AssertFail,
+            150 => Self::AssertThrows,
+            151 => Self::AssertDoesNotThrow,
+            152 => Self::AssertRejects,
+            153 => Self::AssertDoesNotReject,
+            154 => Self::AssertEqual,
+            155 => Self::AssertNotEqual,
+            156 => Self::AssertDeepEqual,
+            157 => Self::AssertNotDeepEqual,
+            158 => Self::AssertStrictEqual,
+            159 => Self::AssertNotStrictEqual,
+            174 => Self::AssertDeepStrictEqual,
+            175 => Self::AssertNotDeepStrictEqual,
+            // New arithmetic superinstructions
+            176 => Self::LoadAdd,
+            177 => Self::LoadSub,
+            178 => Self::LoadMul,
+            179 => Self::LoadInc,
+            180 => Self::LoadDec,
+            // New comparison superinstructions
+            181 => Self::LoadCmpEq,
+            182 => Self::LoadCmpLt,
+            183 => Self::LoadJfalse,
+            184 => Self::LoadCmpEqJfalse,
+            185 => Self::LoadCmpLtJfalse,
+            // Property access superinstructions
+            186 => Self::LoadGetProp,
+            187 => Self::LoadGetPropCmpEq,
+            // Pareto 80% property access superinstructions with IC
+            188 => Self::GetProp2Ic,
+            189 => Self::GetProp3Ic,
+            190 => Self::GetElem,
+            191 => Self::SetElem,
+            192 => Self::GetPropElem,
+            193 => Self::CallMethodIc,
+            194 => Self::CallMethod2Ic,
             other => Self::Reserved(other),
         }
     }
@@ -887,6 +1035,7 @@ impl Opcode {
             Self::MulI => 38,
             Self::DivI => 39,
             Self::ModI => 40,
+            Self::Mod => 61,
             Self::Neg => 41,
             Self::Inc => 42,
             Self::Dec => 43,
@@ -942,6 +1091,7 @@ impl Opcode {
             Self::CreateEnv => 90,
             Self::LoadName => 91,
             Self::StoreName => 92,
+            Self::InitName => 123,
             Self::LoadClosure => 93,
             Self::NewThis => 94,
             Self::TypeofName => 95,
@@ -1007,21 +1157,6 @@ impl Opcode {
             Self::LteJmpLoop => 222,
             Self::NewObjInitProp => 223,
             Self::ProfileHotCall => 224,
-            Self::AssertValue => 225,
-            Self::AssertOk => 226,
-            Self::AssertEqual => 227,
-            Self::AssertNotEqual => 228,
-            Self::AssertDeepEqual => 229,
-            Self::AssertNotDeepEqual => 230,
-            Self::AssertStrictEqual => 231,
-            Self::AssertNotStrictEqual => 232,
-            Self::AssertDeepStrictEqual => 233,
-            Self::AssertNotDeepStrictEqual => 234,
-            Self::AssertThrows => 235,
-            Self::AssertDoesNotThrow => 236,
-            Self::AssertRejects => 237,
-            Self::AssertDoesNotReject => 238,
-            Self::AssertFail => 239,
             Self::Call1SubI => 240,
             Self::JmpLteFalse => 241,
             Self::RetReg => 242,
@@ -1031,6 +1166,73 @@ impl Opcode {
             Self::SubF64 => 246,
             Self::MulI32 => 247,
             Self::MulF64 => 248,
+            // Superinstructions
+            Self::RetIfLteI => 249,
+            Self::AddAccReg => 250,
+            Self::Call1Add => 251,
+            Self::Call2Add => 252,
+            Self::LoadKAdd => 253,
+            Self::LoadKCmp => 254,
+            Self::CmpJmp => 255,
+            // Specialized opcodes
+            Self::AddI32Fast => 130,
+            Self::AddF64Fast => 131,
+            Self::SubI32Fast => 132,
+            Self::MulI32Fast => 133,
+            Self::EqI32Fast => 134,
+            Self::LtI32Fast => 135,
+            Self::JmpI32Fast => 136,
+            Self::GetPropMono => 137,
+            Self::CallMono => 138,
+            // Call opcodes
+            Self::Call0 => 139,
+            Self::Call1 => 140,
+            Self::Call2 => 141,
+            Self::Call3 => 142,
+            Self::CallMethod1 => 143,
+            Self::CallMethod2 => 144,
+            // New arithmetic superinstructions
+            Self::LoadAdd => 176,
+            Self::LoadSub => 177,
+            Self::LoadMul => 178,
+            Self::LoadInc => 179,
+            Self::LoadDec => 180,
+            // New comparison superinstructions
+            Self::LoadCmpEq => 181,
+            Self::LoadCmpLt => 182,
+            Self::LoadJfalse => 183,
+            Self::LoadCmpEqJfalse => 184,
+            Self::LoadCmpLtJfalse => 185,
+            // Property access superinstructions
+            Self::LoadGetProp => 186,
+            Self::LoadGetPropCmpEq => 187,
+            // Pareto 80% property access superinstructions with IC
+            Self::GetProp2Ic => 188,
+            Self::GetProp3Ic => 189,
+            Self::GetElem => 190,
+            Self::SetElem => 191,
+            Self::GetPropElem => 192,
+            Self::CallMethodIc => 193,
+            Self::CallMethod2Ic => 194,
+            // Superinstruction variants
+            Self::GetPropCall => 145,
+            Self::CallRet => 146,
+            // Assertion opcodes
+            Self::AssertValue => 147,
+            Self::AssertOk => 148,
+            Self::AssertFail => 149,
+            Self::AssertThrows => 150,
+            Self::AssertDoesNotThrow => 151,
+            Self::AssertRejects => 152,
+            Self::AssertDoesNotReject => 153,
+            Self::AssertEqual => 154,
+            Self::AssertNotEqual => 155,
+            Self::AssertDeepEqual => 156,
+            Self::AssertNotDeepEqual => 157,
+            Self::AssertStrictEqual => 158,
+            Self::AssertNotStrictEqual => 159,
+            Self::AssertDeepStrictEqual => 174,
+            Self::AssertNotDeepStrictEqual => 175,
             Self::Reserved(value) => value,
         }
     }
@@ -1399,7 +1601,7 @@ impl VM {
     pub fn new(bytecode: Vec<u32>, const_pool: Vec<JSValue>, args: Vec<JSValue>) -> Self {
         let frame = Frame::fresh(args, make_undefined(), 0, 0, None, 0);
 
-        Self {
+        let mut vm = Self {
             frame: FrameStack::new(frame),
             pc: 0,
             bytecode,
@@ -1408,16 +1610,562 @@ impl VM {
             shapes: Vec::new(),
             strings: Vec::new(),
             global_object: HashMap::new(),
+            console_output: Vec::new(),
             scope_chain: Vec::new(),
             upvalues: Vec::new(),
             last_exception: make_undefined(),
             interned_strings: HashMap::new(),
+            compiled_properties: Vec::new(),
+            property_slots: HashMap::new(),
             atoms: AtomTable::new(),
             feedback: RuntimeFeedback::default(),
             heap_shape: Rc::new(AtomShape::new()),
             next_shape_id: 1,
             last_ic_object: None,
+            console_timers: HashMap::new(),
+            console_counts: HashMap::new(),
+            console_group_depth: 0,
+            console_echo: true,
+            dispatch_table: [None; 256],
+        };
+
+        vm.init_dispatch_table();
+        vm
+    }
+
+    pub fn from_compiled(compiled: crate::codegen::CompiledBytecode, args: Vec<JSValue>) -> Self {
+        let crate::codegen::CompiledBytecode {
+            bytecode,
+            constants,
+            string_constants,
+            function_constants: _,
+            names,
+            properties,
+        } = compiled;
+        let mut vm = Self::new(bytecode, constants, args);
+        for (index, text) in string_constants {
+            let value = vm.intern_string(text);
+            if let Some(slot) = vm.const_pool.get_mut(index as usize) {
+                *slot = value;
+            }
         }
+        vm.install_js_builtins(&names, &properties);
+        vm
+    }
+
+    pub fn install_js_builtins(&mut self, names: &[String], properties: &[String]) {
+        self.compiled_properties.clear();
+        self.compiled_properties.extend_from_slice(properties);
+        self.property_slots.clear();
+        for (slot, name) in properties.iter().enumerate() {
+            if let Ok(slot) = u16::try_from(slot) {
+                self.property_slots.insert(name.clone(), slot);
+            }
+        }
+
+        let mut global_slots = HashMap::new();
+        for (slot, name) in names.iter().enumerate() {
+            if let Ok(slot) = u16::try_from(slot) {
+                global_slots.insert(name.as_str(), slot);
+            }
+        }
+
+        if let Some(&slot) = global_slots.get("JSON") {
+            self.install_builtin_object(
+                slot,
+                &[
+                    ("stringify", "__builtin_json_stringify"),
+                    ("parse", "__builtin_json_parse"),
+                ],
+            );
+        }
+
+        if let Some(&slot) = global_slots.get("Msgpack") {
+            self.install_builtin_object(
+                slot,
+                &[
+                    ("encode", "__builtin_msgpack_encode"),
+                    ("decode", "__builtin_msgpack_decode"),
+                ],
+            );
+        }
+
+        if let Some(&slot) = global_slots.get("Bin") {
+            self.install_builtin_object(
+                slot,
+                &[
+                    ("encode", "__builtin_bin_encode"),
+                    ("decode", "__builtin_bin_decode"),
+                ],
+            );
+        }
+
+        if let Some(&slot) = global_slots.get("YAML") {
+            self.install_builtin_object(
+                slot,
+                &[
+                    ("stringify", "__builtin_yaml_stringify"),
+                    ("parse", "__builtin_yaml_parse"),
+                ],
+            );
+        }
+
+        if let Some(&slot) = global_slots.get("Date") {
+            self.install_builtin_object(
+                slot,
+                &[
+                    ("now", "__builtin_date_now"),
+                    ("parse", "__builtin_date_parse"),
+                    ("UTC", "__builtin_date_utc"),
+                ],
+            );
+        }
+
+        if let Some(&slot) = global_slots.get("console") {
+            self.install_builtin_object(
+                slot,
+                &[
+                    ("log", "__builtin_console_log"),
+                    ("error", "__builtin_console_error"),
+                    ("warn", "__builtin_console_warn"),
+                    ("info", "__builtin_console_info"),
+                    ("debug", "__builtin_console_debug"),
+                    ("trace", "__builtin_console_trace"),
+                    ("table", "__builtin_console_table"),
+                    ("time", "__builtin_console_time"),
+                    ("timeEnd", "__builtin_console_time_end"),
+                    ("group", "__builtin_console_group"),
+                    ("groupEnd", "__builtin_console_group_end"),
+                    ("clear", "__builtin_console_clear"),
+                    ("count", "__builtin_console_count"),
+                    ("assert", "__builtin_console_assert"),
+                    ("dir", "__builtin_console_dir"),
+                    ("dirxml", "__builtin_console_dirxml"),
+                    ("timeLog", "__builtin_console_time_log"),
+                ],
+            );
+        }
+    }
+
+    pub fn set_console_echo(&mut self, enabled: bool) {
+        self.console_echo = enabled;
+    }
+
+    fn install_builtin_object(&mut self, global_slot: u16, methods: &[(&str, &str)]) {
+        let object = self.alloc_object();
+        for &(property_name, builtin_name) in methods {
+            if let Some(slot) = self.property_slots.get(property_name).copied() {
+                let function = self.alloc_native_function(Some(builtin_name));
+                let _ = self.set_property(object, PropertyKey::Id(slot), function);
+            }
+        }
+        self.global_object.insert(global_slot, object);
+    }
+
+    /// Initialize the dispatch table with handler functions for hot opcodes
+    fn init_dispatch_table(&mut self) {
+        // Initialize all slots to None
+        for i in 0..256 {
+            self.dispatch_table[i] = None;
+        }
+
+        // Register handlers for hot opcodes (based on Fibonacci benchmark)
+        self.dispatch_table[Opcode::Mov.as_u8() as usize] = Some(Self::handler_mov);
+        self.dispatch_table[Opcode::LoadI.as_u8() as usize] = Some(Self::handler_loadi);
+        self.dispatch_table[Opcode::AddI32.as_u8() as usize] = Some(Self::handler_addi32);
+        self.dispatch_table[Opcode::AddF64.as_u8() as usize] = Some(Self::handler_addf64);
+        self.dispatch_table[Opcode::JmpFalse.as_u8() as usize] = Some(Self::handler_jmpfalse);
+        self.dispatch_table[Opcode::RetReg.as_u8() as usize] = Some(Self::handler_retreg);
+        self.dispatch_table[Opcode::LoadK.as_u8() as usize] = Some(Self::handler_loadk);
+        self.dispatch_table[Opcode::Add.as_u8() as usize] = Some(Self::handler_add);
+        self.dispatch_table[Opcode::Jmp.as_u8() as usize] = Some(Self::handler_jmp);
+        self.dispatch_table[Opcode::Load0.as_u8() as usize] = Some(Self::handler_load0);
+        self.dispatch_table[Opcode::Load1.as_u8() as usize] = Some(Self::handler_load1);
+        self.dispatch_table[Opcode::Eq.as_u8() as usize] = Some(Self::handler_eq);
+        self.dispatch_table[Opcode::Lt.as_u8() as usize] = Some(Self::handler_lt);
+        self.dispatch_table[Opcode::Lte.as_u8() as usize] = Some(Self::handler_lte);
+
+        // Register handlers for new superinstructions
+        self.dispatch_table[Opcode::AddI32Fast.as_u8() as usize] = Some(Self::handler_addi32fast);
+        self.dispatch_table[Opcode::AddF64Fast.as_u8() as usize] = Some(Self::handler_addf64fast);
+        self.dispatch_table[Opcode::SubI32Fast.as_u8() as usize] = Some(Self::handler_subi32fast);
+        self.dispatch_table[Opcode::MulI32Fast.as_u8() as usize] = Some(Self::handler_muli32fast);
+        self.dispatch_table[Opcode::EqI32Fast.as_u8() as usize] = Some(Self::handler_eqi32fast);
+        self.dispatch_table[Opcode::LtI32Fast.as_u8() as usize] = Some(Self::handler_lti32fast);
+        self.dispatch_table[Opcode::JmpI32Fast.as_u8() as usize] = Some(Self::handler_jmpi32fast);
+        self.dispatch_table[Opcode::Call0.as_u8() as usize] = Some(Self::handler_call0);
+        self.dispatch_table[Opcode::Call1.as_u8() as usize] = Some(Self::handler_call1);
+        self.dispatch_table[Opcode::Call2.as_u8() as usize] = Some(Self::handler_call2);
+    }
+
+    // New handler functions for superinstructions
+    fn handler_addi32fast(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+
+        let lhs = vm.frame.regs[b];
+        let rhs = vm.frame.regs[c];
+
+        // Fast path: int32 + int32
+        if lhs.is_int() && rhs.is_int() {
+            let a_int = lhs.int_payload_unchecked();
+            let b_int = rhs.int_payload_unchecked();
+            if let Some(result) = a_int.checked_add(b_int) {
+                vm.frame.regs[ACC] = make_int32(result);
+                if a != ACC {
+                    vm.frame.regs[a] = make_int32(result);
+                }
+                return ControlFlow::Continue;
+            }
+        }
+        // Fall back to slow path
+        let (lhs, rhs) = vm.value_pair(lhs, rhs);
+        vm.frame.regs[ACC] = lhs.add(&rhs).raw();
+        if a != ACC {
+            vm.frame.regs[a] = vm.frame.regs[ACC];
+        }
+        ControlFlow::Continue
+    }
+
+    fn handler_addf64fast(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+
+        let lhs = vm.frame.regs[b];
+        let rhs = vm.frame.regs[c];
+
+        // Fast path: f64 + f64
+        if lhs.is_f64() && rhs.is_f64() {
+            let a_f64 = lhs.f64_payload_unchecked();
+            let b_f64 = rhs.f64_payload_unchecked();
+            vm.frame.regs[ACC] = make_number(a_f64 + b_f64);
+            if a != ACC {
+                vm.frame.regs[a] = vm.frame.regs[ACC];
+            }
+            return ControlFlow::Continue;
+        }
+        // Fall back to slow path
+        let (lhs, rhs) = vm.value_pair(lhs, rhs);
+        vm.frame.regs[ACC] = lhs.add(&rhs).raw();
+        if a != ACC {
+            vm.frame.regs[a] = vm.frame.regs[ACC];
+        }
+        ControlFlow::Continue
+    }
+
+    fn handler_subi32fast(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+
+        let lhs = vm.frame.regs[b];
+        let rhs = vm.frame.regs[c];
+
+        // Fast path: int32 - int32
+        if lhs.is_int() && rhs.is_int() {
+            let a_int = lhs.int_payload_unchecked();
+            let b_int = rhs.int_payload_unchecked();
+            if let Some(result) = a_int.checked_sub(b_int) {
+                vm.frame.regs[ACC] = make_int32(result);
+                if a != ACC {
+                    vm.frame.regs[a] = make_int32(result);
+                }
+                return ControlFlow::Continue;
+            }
+        }
+        // Fall back to slow path
+        let (lhs, rhs) = vm.value_pair(lhs, rhs);
+        vm.frame.regs[ACC] = lhs.sub(&rhs).raw();
+        if a != ACC {
+            vm.frame.regs[a] = vm.frame.regs[ACC];
+        }
+        ControlFlow::Continue
+    }
+
+    fn handler_muli32fast(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+
+        let lhs = vm.frame.regs[b];
+        let rhs = vm.frame.regs[c];
+
+        // Fast path: int32 * int32
+        if lhs.is_int() && rhs.is_int() {
+            let a_int = lhs.int_payload_unchecked();
+            let b_int = rhs.int_payload_unchecked();
+            if let Some(result) = a_int.checked_mul(b_int) {
+                vm.frame.regs[ACC] = make_int32(result);
+                if a != ACC {
+                    vm.frame.regs[a] = make_int32(result);
+                }
+                return ControlFlow::Continue;
+            }
+        }
+        // Fall back to slow path
+        let (lhs, rhs) = vm.value_pair(lhs, rhs);
+        vm.frame.regs[ACC] = lhs.mul(&rhs).raw();
+        if a != ACC {
+            vm.frame.regs[a] = vm.frame.regs[ACC];
+        }
+        ControlFlow::Continue
+    }
+
+    fn handler_eqi32fast(vm: &mut VM, insn: u32) -> ControlFlow {
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+
+        let lhs = vm.frame.regs[b];
+        let rhs = vm.frame.regs[c];
+
+        // Fast path: int32 == int32
+        if lhs.is_int() && rhs.is_int() {
+            let a_int = lhs.int_payload_unchecked();
+            let b_int = rhs.int_payload_unchecked();
+            vm.frame.regs[ACC] = make_bool(a_int == b_int);
+            return ControlFlow::Continue;
+        }
+        // Fall back to slow path
+        let (lhs, rhs) = vm.value_pair(lhs, rhs);
+        vm.frame.regs[ACC] = lhs.eq(&rhs).raw();
+        ControlFlow::Continue
+    }
+
+    fn handler_lti32fast(vm: &mut VM, insn: u32) -> ControlFlow {
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+
+        let lhs = vm.frame.regs[b];
+        let rhs = vm.frame.regs[c];
+
+        // Fast path: int32 < int32
+        if lhs.is_int() && rhs.is_int() {
+            let a_int = lhs.int_payload_unchecked();
+            let b_int = rhs.int_payload_unchecked();
+            vm.frame.regs[ACC] = make_bool(a_int < b_int);
+            return ControlFlow::Continue;
+        }
+        // Fall back to slow path
+        let (lhs, rhs) = vm.value_pair(lhs, rhs);
+        vm.frame.regs[ACC] = lhs.lt(&rhs).raw();
+        ControlFlow::Continue
+    }
+
+    fn handler_jmpi32fast(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+
+        let lhs = vm.frame.regs[a];
+        let rhs = vm.frame.regs[b];
+
+        // Fast path: int32 < int32
+        if lhs.is_int() && rhs.is_int() {
+            let a_int = lhs.int_payload_unchecked();
+            let b_int = rhs.int_payload_unchecked();
+            if a_int < b_int {
+                vm.jump_by(c as i8 as i16);
+            }
+            return ControlFlow::Continue;
+        }
+        // Fall back to slow path
+        if vm.less_than(lhs, rhs) {
+            vm.jump_by(c as i8 as i16);
+        }
+        ControlFlow::Continue
+    }
+
+    fn handler_call0(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        match vm.dispatch_call_value(vm.frame.regs[a], vm.frame.regs[0], &[]) {
+            CallAction::Returned(result) => {
+                vm.frame.regs[ACC] = result;
+                ControlFlow::Continue
+            }
+            CallAction::EnteredFrame => ControlFlow::Continue,
+        }
+    }
+
+    fn handler_call1(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let b = ((insn >> 16) & 0xFF) as usize;
+        match vm.dispatch_call_value(vm.frame.regs[a], vm.frame.regs[0], &[vm.frame.regs[b]]) {
+            CallAction::Returned(result) => {
+                vm.frame.regs[ACC] = result;
+                ControlFlow::Continue
+            }
+            CallAction::EnteredFrame => ControlFlow::Continue,
+        }
+    }
+
+    fn handler_call2(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+        match vm.dispatch_call_value(
+            vm.frame.regs[a],
+            vm.frame.regs[0],
+            &[vm.frame.regs[b], vm.frame.regs[c]],
+        ) {
+            CallAction::Returned(result) => {
+                vm.frame.regs[ACC] = result;
+                ControlFlow::Continue
+            }
+            CallAction::EnteredFrame => ControlFlow::Continue,
+        }
+    }
+
+    // Handler functions for hot opcodes
+    fn handler_mov(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let b = ((insn >> 16) & 0xFF) as usize;
+        vm.frame.regs[a] = vm.frame.regs[b];
+        ControlFlow::Continue
+    }
+
+    fn handler_loadi(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let sbx = ((insn >> 16) & 0xFFFF) as u16 as i16;
+        vm.frame.regs[a] = make_int32(sbx as i32);
+        ControlFlow::Continue
+    }
+
+    fn handler_addi32(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+
+        let lhs = vm.frame.regs[b];
+        let rhs = vm.frame.regs[c];
+
+        // Fast path: int32 + int32
+        if lhs.is_int() && rhs.is_int() {
+            let a_int = lhs.int_payload_unchecked();
+            let b_int = rhs.int_payload_unchecked();
+            if let Some(result) = a_int.checked_add(b_int) {
+                vm.frame.regs[ACC] = make_int32(result);
+                if a != ACC {
+                    vm.frame.regs[a] = make_int32(result);
+                }
+                return ControlFlow::Continue;
+            }
+        }
+
+        // Fall back to slow path
+        let (lhs, rhs) = vm.value_pair(lhs, rhs);
+        vm.frame.regs[ACC] = lhs.add(&rhs).raw();
+        if a != ACC {
+            vm.frame.regs[a] = vm.frame.regs[ACC];
+        }
+        ControlFlow::Continue
+    }
+
+    fn handler_addf64(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+
+        let lhs = vm.frame.regs[b];
+        let rhs = vm.frame.regs[c];
+
+        // Fast path: f64 + f64
+        if lhs.is_f64() && rhs.is_f64() {
+            let a_f64 = lhs.f64_payload_unchecked();
+            let b_f64 = rhs.f64_payload_unchecked();
+            vm.frame.regs[ACC] = make_number(a_f64 + b_f64);
+            if a != ACC {
+                vm.frame.regs[a] = vm.frame.regs[ACC];
+            }
+            return ControlFlow::Continue;
+        }
+
+        // Fall back to slow path
+        let (lhs, rhs) = vm.value_pair(lhs, rhs);
+        vm.frame.regs[ACC] = lhs.add(&rhs).raw();
+        if a != ACC {
+            vm.frame.regs[a] = vm.frame.regs[ACC];
+        }
+        ControlFlow::Continue
+    }
+
+    fn handler_jmpfalse(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let sbx = ((insn >> 16) & 0xFFFF) as u16 as i16;
+
+        if !vm.is_truthy_value(vm.frame.regs[a]) {
+            vm.jump_by(sbx);
+        }
+        ControlFlow::Continue
+    }
+
+    fn handler_retreg(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+
+        if !vm.exit_frame(vm.frame.regs[a]) {
+            return ControlFlow::Stop;
+        }
+        ControlFlow::Continue
+    }
+
+    fn handler_loadk(vm: &mut VM, insn: u32) -> ControlFlow {
+        let a = ((insn >> 8) & 0xFF) as usize;
+        let index = ((insn >> 16) & 0xFFFF) as usize;
+        vm.frame.regs[a] = vm
+            .const_pool
+            .get(index)
+            .copied()
+            .unwrap_or(make_undefined());
+        ControlFlow::Continue
+    }
+
+    fn handler_add(vm: &mut VM, insn: u32) -> ControlFlow {
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+        let (lhs, rhs) = vm.value_pair(vm.frame.regs[b], vm.frame.regs[c]);
+        vm.frame.regs[ACC] = lhs.add(&rhs).raw();
+        ControlFlow::Continue
+    }
+
+    fn handler_jmp(vm: &mut VM, insn: u32) -> ControlFlow {
+        let sbx = ((insn >> 16) & 0xFFFF) as u16 as i16;
+        vm.jump_by(sbx);
+        ControlFlow::Continue
+    }
+
+    fn handler_load0(vm: &mut VM, _insn: u32) -> ControlFlow {
+        vm.frame.regs[ACC] = make_int32(0);
+        ControlFlow::Continue
+    }
+
+    fn handler_load1(vm: &mut VM, _insn: u32) -> ControlFlow {
+        vm.frame.regs[ACC] = make_int32(1);
+        ControlFlow::Continue
+    }
+
+    fn handler_eq(vm: &mut VM, insn: u32) -> ControlFlow {
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+        let (lhs, rhs) = vm.value_pair(vm.frame.regs[b], vm.frame.regs[c]);
+        vm.frame.regs[ACC] = lhs.eq(&rhs).raw();
+        ControlFlow::Continue
+    }
+
+    fn handler_lt(vm: &mut VM, insn: u32) -> ControlFlow {
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+        let (lhs, rhs) = vm.value_pair(vm.frame.regs[b], vm.frame.regs[c]);
+        vm.frame.regs[ACC] = lhs.lt(&rhs).raw();
+        ControlFlow::Continue
+    }
+
+    fn handler_lte(vm: &mut VM, insn: u32) -> ControlFlow {
+        let b = ((insn >> 16) & 0xFF) as usize;
+        let c = ((insn >> 24) & 0xFF) as usize;
+        let (lhs, rhs) = vm.value_pair(vm.frame.regs[b], vm.frame.regs[c]);
+        vm.frame.regs[ACC] = lhs.le(&rhs).raw();
+        ControlFlow::Continue
     }
 
     fn value_op(&mut self, value: JSValue) -> VmValue {
@@ -1598,9 +2346,27 @@ impl VM {
     }
 
     fn alloc_object_with_kind(&mut self, kind: ObjectKind) -> JSValue {
+        let heap_kind = match &kind {
+            ObjectKind::Ordinary(_) | ObjectKind::Env(_) => HeapKind::Object,
+            ObjectKind::Array(_) => HeapKind::Array,
+            ObjectKind::BoolArray(_) => HeapKind::BoolArray,
+            ObjectKind::Uint8Array(_) => HeapKind::Uint8Array,
+            ObjectKind::Int32Array(_) => HeapKind::Int32Array,
+            ObjectKind::Float64Array(_) => HeapKind::Float64Array,
+            ObjectKind::StringArray(_) => HeapKind::StringArray,
+            ObjectKind::Iterator { .. } => HeapKind::Object,
+            ObjectKind::Function(_) => HeapKind::Function,
+            ObjectKind::Closure(_) => HeapKind::Closure,
+            ObjectKind::NativeFunction(_) => HeapKind::NativeFunction,
+            ObjectKind::NativeClosure(_) => HeapKind::NativeClosure,
+            ObjectKind::Class(_) => HeapKind::Class,
+            ObjectKind::Module(_) => HeapKind::Module,
+            ObjectKind::Instance(_) => HeapKind::Instance,
+            ObjectKind::Symbol(_) => HeapKind::Symbol,
+        };
         let shape = self.alloc_shape();
         let obj = Box::new(JSObject {
-            header: GCHeader::new(ObjType::Object),
+            header: GCHeader::with_kind(ObjType::Object, heap_kind),
             shape,
             properties: HashMap::new(),
             kind,
@@ -1614,7 +2380,7 @@ impl VM {
         self.alloc_object_with_kind(ObjectKind::Ordinary(QObject::new(self.heap_shape.clone())))
     }
 
-    fn alloc_array(&mut self, size_hint: usize) -> JSValue {
+    pub fn alloc_array(&mut self, size_hint: usize) -> JSValue {
         let mut array = QArray::new(self.heap_shape.clone());
         array.elements = Vec::with_capacity(size_hint);
         self.alloc_object_with_kind(ObjectKind::Array(array))
@@ -1631,6 +2397,14 @@ impl VM {
             body: Vec::new(),
             prototype: None,
             descriptor,
+        }))
+    }
+
+    fn alloc_native_function(&mut self, name: Option<&str>) -> JSValue {
+        let name = name.map(|name| self.atoms.intern(name));
+        self.alloc_object_with_kind(ObjectKind::NativeFunction(QNativeFunction {
+            name,
+            callback: builtin_native_stub,
         }))
     }
 
@@ -1674,6 +2448,834 @@ impl VM {
 
     fn string_equals(&self, value: JSValue, expected: &str) -> bool {
         self.string_text(value) == Some(expected)
+    }
+
+    fn property_key_to_text(&self, key: PropertyKey) -> Option<String> {
+        match key {
+            PropertyKey::Id(slot) => self
+                .compiled_properties
+                .get(slot as usize)
+                .cloned()
+                .or_else(|| Some(slot.to_string())),
+            PropertyKey::Atom(atom) => Some(self.atoms.resolve(atom).to_owned()),
+            PropertyKey::Index(index) => Some(index.to_string()),
+            PropertyKey::Value(value) => {
+                if let Some(text) = self.string_text(value) {
+                    Some(text.to_owned())
+                } else if let Some(value) = to_i32(value) {
+                    Some(value.to_string())
+                } else if let Some(value) = to_f64(value) {
+                    Some(value.to_string())
+                } else if let Some(value) = bool_from_value(value) {
+                    Some(if value { "true" } else { "false" }.to_owned())
+                } else if is_null(value) {
+                    Some("null".to_owned())
+                } else if is_undefined(value) {
+                    Some("undefined".to_owned())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn property_key_for_name(&mut self, name: &str) -> PropertyKey {
+        if let Some(&slot) = self.property_slots.get(name) {
+            PropertyKey::Id(slot)
+        } else {
+            PropertyKey::Atom(self.atoms.intern(name))
+        }
+    }
+
+    fn vm_to_runtime_value(
+        &self,
+        ctx: &Context,
+        value: JSValue,
+        seen: &mut HashMap<usize, JSValue>,
+    ) -> Result<JSValue, String> {
+        if value.is_undefined()
+            || value.is_null()
+            || value.as_bool().is_some()
+            || value.as_i32().is_some()
+            || value.as_f64().is_some()
+        {
+            return Ok(value);
+        }
+
+        if let Some(text) = self.string_text(value) {
+            return Ok(JSValue::atom(ctx.intern(text)));
+        }
+
+        let Some(obj_ptr) = object_from_value(value) else {
+            return Err(format!("unsupported VM value: {}", value.type_name()));
+        };
+        let key = obj_ptr as usize;
+        if let Some(existing) = seen.get(&key).copied() {
+            return Ok(existing);
+        }
+
+        unsafe {
+            match &(*obj_ptr).kind {
+                ObjectKind::Array(array) => {
+                    let out = ctx.new_array();
+                    let out_value = JSValue::from(out.clone());
+                    seen.insert(key, out_value);
+                    let mut out_ref = out.borrow_mut();
+                    for &element in &array.elements {
+                        out_ref.push(self.vm_to_runtime_value(ctx, element, seen)?);
+                    }
+                    Ok(out_value)
+                }
+                ObjectKind::BoolArray(array) => {
+                    let out = ctx.new_bool_array();
+                    let out_value = JSValue::from(out.clone());
+                    seen.insert(key, out_value);
+                    let mut out_ref = out.borrow_mut();
+                    for &element in &array.elements {
+                        out_ref.push(element);
+                    }
+                    Ok(out_value)
+                }
+                ObjectKind::Uint8Array(array) => {
+                    let out = ctx.new_uint8_array();
+                    let out_value = JSValue::from(out.clone());
+                    seen.insert(key, out_value);
+                    let mut out_ref = out.borrow_mut();
+                    for &element in &array.elements {
+                        out_ref.push(element);
+                    }
+                    Ok(out_value)
+                }
+                ObjectKind::Int32Array(array) => {
+                    let out = ctx.new_int32_array();
+                    let out_value = JSValue::from(out.clone());
+                    seen.insert(key, out_value);
+                    let mut out_ref = out.borrow_mut();
+                    for &element in &array.elements {
+                        out_ref.push(element);
+                    }
+                    Ok(out_value)
+                }
+                ObjectKind::Float64Array(array) => {
+                    let out = ctx.new_float64_array();
+                    let out_value = JSValue::from(out.clone());
+                    seen.insert(key, out_value);
+                    let mut out_ref = out.borrow_mut();
+                    for &element in &array.elements {
+                        out_ref.push(element);
+                    }
+                    Ok(out_value)
+                }
+                ObjectKind::StringArray(array) => {
+                    let out = ctx.new_string_array();
+                    let out_value = JSValue::from(out.clone());
+                    seen.insert(key, out_value);
+                    let mut out_ref = out.borrow_mut();
+                    for &element in &array.elements {
+                        out_ref.push(self.vm_to_runtime_value(ctx, element, seen)?);
+                    }
+                    Ok(out_value)
+                }
+                ObjectKind::Ordinary(_) | ObjectKind::Env(_) | ObjectKind::Instance(_) => {
+                    let out = ctx.new_object();
+                    let out_value = JSValue::from(out.clone());
+                    seen.insert(key, out_value);
+                    let mut out_ref = out.borrow_mut();
+                    for (&property_key, &child) in &(*obj_ptr).properties {
+                        let Some(name) = self.property_key_to_text(property_key) else {
+                            continue;
+                        };
+                        let child = self.vm_to_runtime_value(ctx, child, seen)?;
+                        out_ref.set(ctx.intern(&name), child);
+                    }
+                    Ok(out_value)
+                }
+                ObjectKind::Iterator { .. } => {
+                    Err("iterators are not supported by serializers".to_owned())
+                }
+                ObjectKind::Function(_) => {
+                    Err("functions are not supported by serializers".to_owned())
+                }
+                ObjectKind::Closure(_) => {
+                    Err("closures are not supported by serializers".to_owned())
+                }
+                ObjectKind::NativeFunction(_) => {
+                    Err("native functions are not supported by serializers".to_owned())
+                }
+                ObjectKind::NativeClosure(_) => {
+                    Err("native closures are not supported by serializers".to_owned())
+                }
+                ObjectKind::Class(_) => Err("classes are not supported by serializers".to_owned()),
+                ObjectKind::Module(_) => Err("modules are not supported by serializers".to_owned()),
+                ObjectKind::Symbol(_) => Err("symbols are not supported by serializers".to_owned()),
+            }
+        }
+    }
+
+    fn runtime_to_vm_value(
+        &mut self,
+        ctx: &Context,
+        value: JSValue,
+        seen: &mut HashMap<usize, JSValue>,
+    ) -> Result<JSValue, String> {
+        if value.is_undefined()
+            || value.is_null()
+            || value.as_bool().is_some()
+            || value.as_i32().is_some()
+            || value.as_f64().is_some()
+        {
+            return Ok(value);
+        }
+
+        if let Some(atom) = value.as_atom() {
+            return Ok(self.intern_string(ctx.resolve(atom)));
+        }
+
+        if value.heap_kind() == Some(HeapKind::String) {
+            let string = Gc::<QString>::try_from(value).map_err(|error| error.to_string())?;
+            let text = ctx.resolve(string.borrow().atom);
+            return Ok(self.intern_string(text));
+        }
+
+        let ptr = value
+            .as_heap_ptr()
+            .map(|ptr| ptr as usize)
+            .ok_or_else(|| format!("unsupported runtime value: {}", value.type_name()))?;
+        if let Some(existing) = seen.get(&ptr).copied() {
+            return Ok(existing);
+        }
+
+        match value.heap_kind() {
+            Some(HeapKind::Object) => {
+                let object = Gc::<QObject>::try_from(value).map_err(|error| error.to_string())?;
+                let out = self.alloc_object();
+                seen.insert(ptr, out);
+                let object_ref = object.borrow();
+                let props: Vec<_> = object_ref
+                    .shape
+                    .props
+                    .iter()
+                    .map(|(&atom, &index)| (atom, index))
+                    .collect();
+                for (atom, index) in props {
+                    let child = object_ref
+                        .values
+                        .get(index)
+                        .copied()
+                        .unwrap_or_else(make_undefined);
+                    let child = self.runtime_to_vm_value(ctx, child, seen)?;
+                    let key = self.property_key_for_name(ctx.rt.borrow().atoms.resolve(atom));
+                    let _ = self.set_property(out, key, child);
+                }
+                Ok(out)
+            }
+            Some(HeapKind::Array) => {
+                let array = Gc::<QArray>::try_from(value).map_err(|error| error.to_string())?;
+                let out = self.alloc_array(array.borrow().elements.len());
+                seen.insert(ptr, out);
+                let elements = array.borrow().elements.clone();
+                for (index, element) in elements.into_iter().enumerate() {
+                    let element = self.runtime_to_vm_value(ctx, element, seen)?;
+                    let _ = self.set_property(out, PropertyKey::Index(index as u32), element);
+                }
+                Ok(out)
+            }
+            Some(HeapKind::BoolArray) => {
+                let array = Gc::<QBoolArray>::try_from(value).map_err(|error| error.to_string())?;
+                let out = self.alloc_array(array.borrow().elements.len());
+                seen.insert(ptr, out);
+                let elements = array.borrow().elements.clone();
+                for (index, element) in elements.into_iter().enumerate() {
+                    let _ = self.set_property(
+                        out,
+                        PropertyKey::Index(index as u32),
+                        make_bool(element),
+                    );
+                }
+                Ok(out)
+            }
+            Some(HeapKind::Uint8Array) => {
+                let array =
+                    Gc::<QUint8Array>::try_from(value).map_err(|error| error.to_string())?;
+                Ok(self.bytes_to_value(&array.borrow().elements))
+            }
+            Some(HeapKind::Int32Array) => {
+                let array =
+                    Gc::<QInt32Array>::try_from(value).map_err(|error| error.to_string())?;
+                let out = self.alloc_array(array.borrow().elements.len());
+                seen.insert(ptr, out);
+                let elements = array.borrow().elements.clone();
+                for (index, element) in elements.into_iter().enumerate() {
+                    let _ = self.set_property(
+                        out,
+                        PropertyKey::Index(index as u32),
+                        make_int32(element),
+                    );
+                }
+                Ok(out)
+            }
+            Some(HeapKind::Float64Array) => {
+                let array =
+                    Gc::<QFloat64Array>::try_from(value).map_err(|error| error.to_string())?;
+                let out = self.alloc_array(array.borrow().elements.len());
+                seen.insert(ptr, out);
+                let elements = array.borrow().elements.clone();
+                for (index, element) in elements.into_iter().enumerate() {
+                    let _ = self.set_property(
+                        out,
+                        PropertyKey::Index(index as u32),
+                        make_number(element),
+                    );
+                }
+                Ok(out)
+            }
+            Some(HeapKind::StringArray) => {
+                let array =
+                    Gc::<QStringArray>::try_from(value).map_err(|error| error.to_string())?;
+                let out = self.alloc_array(array.borrow().elements.len());
+                seen.insert(ptr, out);
+                let elements = array.borrow().elements.clone();
+                for (index, element) in elements.into_iter().enumerate() {
+                    let element = self.runtime_to_vm_value(ctx, element, seen)?;
+                    let _ = self.set_property(out, PropertyKey::Index(index as u32), element);
+                }
+                Ok(out)
+            }
+            Some(HeapKind::Function) => {
+                Err("functions are not supported by VM serializer bridge".to_owned())
+            }
+            Some(HeapKind::Closure) => {
+                Err("closures are not supported by VM serializer bridge".to_owned())
+            }
+            Some(HeapKind::NativeFunction) => {
+                Err("native functions are not supported by VM serializer bridge".to_owned())
+            }
+            Some(HeapKind::NativeClosure) => {
+                Err("native closures are not supported by VM serializer bridge".to_owned())
+            }
+            Some(HeapKind::Class) => {
+                Err("classes are not supported by VM serializer bridge".to_owned())
+            }
+            Some(HeapKind::Module) => {
+                Err("modules are not supported by VM serializer bridge".to_owned())
+            }
+            Some(HeapKind::Instance) => {
+                Err("instances are not supported by VM serializer bridge".to_owned())
+            }
+            Some(HeapKind::Symbol) => {
+                Err("symbols are not supported by VM serializer bridge".to_owned())
+            }
+            Some(HeapKind::String) => unreachable!(),
+            None => Err("unknown runtime heap value".to_owned()),
+        }
+    }
+
+    fn byte_from_value(&self, value: JSValue) -> Option<u8> {
+        u8::try_from(to_i32(value)?).ok()
+    }
+
+    fn bytes_from_value(&self, value: JSValue) -> Option<Vec<u8>> {
+        if let Some(obj_ptr) = object_from_value(value) {
+            unsafe {
+                match &(*obj_ptr).kind {
+                    ObjectKind::Array(array) => {
+                        return array
+                            .elements
+                            .iter()
+                            .map(|&element| self.byte_from_value(element))
+                            .collect();
+                    }
+                    ObjectKind::Uint8Array(array) => return Some(array.elements.clone()),
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    fn bytes_to_value(&mut self, bytes: &[u8]) -> JSValue {
+        let out = self.alloc_array(bytes.len());
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            let _ = self.set_property(
+                out,
+                PropertyKey::Index(index as u32),
+                make_int32(byte as i32),
+            );
+        }
+        out
+    }
+
+    fn dispatch_native_function(
+        &mut self,
+        function: &QNativeFunction,
+        this_value: JSValue,
+        args: &[JSValue],
+    ) -> JSValue {
+        if let Some(name) = function.name {
+            match self.atoms.resolve(name) {
+                "__builtin_json_stringify" => return self.json_stringify_builtin(args),
+                "__builtin_json_parse" => return self.json_parse_builtin(args),
+                "__builtin_yaml_stringify" => return self.yaml_stringify_builtin(args),
+                "__builtin_yaml_parse" => return self.yaml_parse_builtin(args),
+                "__builtin_msgpack_encode" => return self.msgpack_encode_builtin(args),
+                "__builtin_msgpack_decode" => return self.msgpack_decode_builtin(args),
+                "__builtin_bin_encode" => return self.bin_encode_builtin(args),
+                "__builtin_bin_decode" => return self.bin_decode_builtin(args),
+                "__builtin_date_now" => return self.date_now_builtin(args),
+                "__builtin_date_parse" => return self.date_parse_builtin(args),
+                "__builtin_date_utc" => return self.date_utc_builtin(args),
+                "__builtin_console_log" => return self.console_log_builtin(args),
+                "__builtin_console_error" => return self.console_error_builtin(args),
+                "__builtin_console_warn" => return self.console_warn_builtin(args),
+                "__builtin_console_info" => return self.console_info_builtin(args),
+                "__builtin_console_debug" => return self.console_debug_builtin(args),
+                "__builtin_console_trace" => return self.console_trace_builtin(args),
+                "__builtin_console_table" => return self.console_table_builtin(args),
+                "__builtin_console_time" => return self.console_time_builtin(args),
+                "__builtin_console_time_end" => return self.console_time_end_builtin(args),
+                "__builtin_console_group" => return self.console_group_builtin(args),
+                "__builtin_console_group_end" => return self.console_group_end_builtin(args),
+                "__builtin_console_clear" => return self.console_clear_builtin(),
+                "__builtin_console_count" => return self.console_count_builtin(args),
+                "__builtin_console_assert" => return self.console_assert_builtin(args),
+                "__builtin_console_dir" => return self.console_dir_builtin(args),
+                "__builtin_console_dirxml" => return self.console_dirxml_builtin(args),
+                "__builtin_console_time_log" => return self.console_time_log_builtin(args),
+                _ => {}
+            }
+        }
+
+        with_bridge_context(|ctx| (function.callback)(ctx, this_value, args))
+    }
+
+    fn dispatch_native_closure(
+        &mut self,
+        function: &QNativeClosure,
+        this_value: JSValue,
+        args: &[JSValue],
+    ) -> JSValue {
+        with_bridge_context(|ctx| (function.callback)(ctx, this_value, args))
+    }
+
+    fn json_stringify_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let Some(value) = args.first().copied() else {
+            return make_undefined();
+        };
+        match with_bridge_context(|ctx| -> Result<String, String> {
+            let mut seen = HashMap::new();
+            let value = self.vm_to_runtime_value(ctx, value, &mut seen)?;
+            let text = value.to_json(ctx).map_err(|error| error.to_string())?;
+            Ok(text)
+        }) {
+            Ok(text) => self.intern_string(text),
+            Err(_) => make_undefined(),
+        }
+    }
+
+    fn json_parse_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let Some(text) = args
+            .first()
+            .and_then(|value| self.string_text(*value).map(str::to_owned))
+        else {
+            return make_undefined();
+        };
+        match with_bridge_context(|ctx| -> Result<JSValue, String> {
+            let value = JSValue::from_json(ctx, &text).map_err(|error| error.to_string())?;
+            let mut seen = HashMap::new();
+            self.runtime_to_vm_value(ctx, value, &mut seen)
+        }) {
+            Ok(value) => value,
+            Err(_) => make_undefined(),
+        }
+    }
+
+    fn yaml_stringify_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let Some(value) = args.first().copied() else {
+            return make_undefined();
+        };
+        match with_bridge_context(|ctx| -> Result<String, String> {
+            let mut seen = HashMap::new();
+            let value = self.vm_to_runtime_value(ctx, value, &mut seen)?;
+            value.to_yaml(ctx).map_err(|error| error.to_string())
+        }) {
+            Ok(text) => self.intern_string(text),
+            Err(_) => make_undefined(),
+        }
+    }
+
+    fn yaml_parse_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let Some(text) = args
+            .first()
+            .and_then(|value| self.string_text(*value).map(str::to_owned))
+        else {
+            return make_undefined();
+        };
+        match with_bridge_context(|ctx| -> Result<JSValue, String> {
+            let value = JSValue::from_yaml(ctx, &text).map_err(|error| error.to_string())?;
+            let mut seen = HashMap::new();
+            self.runtime_to_vm_value(ctx, value, &mut seen)
+        }) {
+            Ok(value) => value,
+            Err(_) => make_undefined(),
+        }
+    }
+
+    fn msgpack_encode_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let Some(value) = args.first().copied() else {
+            return make_undefined();
+        };
+        match with_bridge_context(|ctx| -> Result<Vec<u8>, String> {
+            let mut seen = HashMap::new();
+            let value = self.vm_to_runtime_value(ctx, value, &mut seen)?;
+            value.to_msgpack(ctx).map_err(|error| error.to_string())
+        }) {
+            Ok(bytes) => self.bytes_to_value(&bytes),
+            Err(_) => make_undefined(),
+        }
+    }
+
+    fn msgpack_decode_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let Some(bytes) = args.first().and_then(|value| self.bytes_from_value(*value)) else {
+            return make_undefined();
+        };
+        match with_bridge_context(|ctx| -> Result<JSValue, String> {
+            let value = JSValue::from_msgpack(ctx, &bytes).map_err(|error| error.to_string())?;
+            let mut seen = HashMap::new();
+            self.runtime_to_vm_value(ctx, value, &mut seen)
+        }) {
+            Ok(value) => value,
+            Err(_) => make_undefined(),
+        }
+    }
+
+    fn bin_encode_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let Some(value) = args.first().copied() else {
+            return make_undefined();
+        };
+        match with_bridge_context(|ctx| -> Result<Vec<u8>, String> {
+            let mut seen = HashMap::new();
+            let value = self.vm_to_runtime_value(ctx, value, &mut seen)?;
+            value
+                .to_arena_buffer(ctx)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(bytes) => self.bytes_to_value(&bytes),
+            Err(_) => make_undefined(),
+        }
+    }
+
+    fn bin_decode_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let Some(bytes) = args.first().and_then(|value| self.bytes_from_value(*value)) else {
+            return make_undefined();
+        };
+        match with_bridge_context(|ctx| -> Result<JSValue, String> {
+            let value =
+                JSValue::from_arena_buffer(ctx, &bytes).map_err(|error| error.to_string())?;
+            let mut seen = HashMap::new();
+            self.runtime_to_vm_value(ctx, value, &mut seen)
+        }) {
+            Ok(value) => value,
+            Err(_) => make_undefined(),
+        }
+    }
+
+    fn date_now_builtin(&mut self, _args: &[JSValue]) -> JSValue {
+        let millis = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs_f64() * 1000.0,
+            Err(_) => 0.0,
+        };
+        make_number(millis)
+    }
+
+    fn date_parse_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let Some(value) = args.first().copied() else {
+            return make_number(f64::NAN);
+        };
+        let text = self.display_string(value);
+        match Self::parse_date_text_to_millis(&text) {
+            Some(millis) => make_number(millis as f64),
+            None => make_number(f64::NAN),
+        }
+    }
+
+    fn date_utc_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let Some(year) = self.date_integer_arg(args, 0, None) else {
+            return make_number(f64::NAN);
+        };
+        let Some(month_index) = self.date_integer_arg(args, 1, None) else {
+            return make_number(f64::NAN);
+        };
+        let Some(day) = self.date_integer_arg(args, 2, Some(1)) else {
+            return make_number(f64::NAN);
+        };
+        let Some(hours) = self.date_integer_arg(args, 3, Some(0)) else {
+            return make_number(f64::NAN);
+        };
+        let Some(minutes) = self.date_integer_arg(args, 4, Some(0)) else {
+            return make_number(f64::NAN);
+        };
+        let Some(seconds) = self.date_integer_arg(args, 5, Some(0)) else {
+            return make_number(f64::NAN);
+        };
+        let Some(milliseconds) = self.date_integer_arg(args, 6, Some(0)) else {
+            return make_number(f64::NAN);
+        };
+
+        match Self::utc_millis_from_components(
+            year,
+            month_index,
+            day,
+            hours,
+            minutes,
+            seconds,
+            milliseconds,
+        ) {
+            Some(millis) => make_number(millis as f64),
+            None => make_number(f64::NAN),
+        }
+    }
+
+    fn date_integer_arg(
+        &mut self,
+        args: &[JSValue],
+        index: usize,
+        default: Option<i64>,
+    ) -> Option<i64> {
+        let value = match args.get(index).copied() {
+            Some(value) => value,
+            None => return default,
+        };
+        let numeric = to_f64(self.number_value(value))?;
+        if !numeric.is_finite() || numeric < i64::MIN as f64 || numeric > i64::MAX as f64 {
+            return None;
+        }
+        Some(numeric.trunc() as i64)
+    }
+
+    fn parse_date_text_to_millis(text: &str) -> Option<i64> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+
+        if let Ok(value) = DateTime::parse_from_rfc3339(text) {
+            return Some(value.timestamp_millis());
+        }
+
+        if let Ok(value) = DateTime::parse_from_rfc2822(text) {
+            return Some(value.timestamp_millis());
+        }
+
+        for format in [
+            "%Y-%m-%dT%H:%M:%S%.f",
+            "%Y-%m-%d %H:%M:%S%.f",
+            "%Y-%m-%dT%H:%M",
+            "%Y-%m-%d %H:%M",
+        ] {
+            if let Ok(value) = NaiveDateTime::parse_from_str(text, format) {
+                return Some(value.and_utc().timestamp_millis());
+            }
+        }
+
+        NaiveDate::parse_from_str(text, "%Y-%m-%d")
+            .ok()?
+            .and_hms_opt(0, 0, 0)
+            .map(|value| value.and_utc().timestamp_millis())
+    }
+
+    fn utc_millis_from_components(
+        year: i64,
+        month_index: i64,
+        day: i64,
+        hours: i64,
+        minutes: i64,
+        seconds: i64,
+        milliseconds: i64,
+    ) -> Option<i64> {
+        let year = if (0..=99).contains(&year) {
+            year + 1900
+        } else {
+            year
+        };
+        let total_months = year.checked_mul(12)?.checked_add(month_index)?;
+        let normalized_year = i32::try_from(total_months.div_euclid(12)).ok()?;
+        let normalized_month = u32::try_from(total_months.rem_euclid(12) + 1).ok()?;
+
+        let base = NaiveDate::from_ymd_opt(normalized_year, normalized_month, 1)?
+            .and_hms_milli_opt(0, 0, 0, 0)?;
+
+        let value = base
+            .checked_add_signed(Duration::days(day - 1))?
+            .checked_add_signed(Duration::hours(hours))?
+            .checked_add_signed(Duration::minutes(minutes))?
+            .checked_add_signed(Duration::seconds(seconds))?
+            .checked_add_signed(Duration::milliseconds(milliseconds))?;
+
+        Some(value.and_utc().timestamp_millis())
+    }
+
+    fn console_render_args(&mut self, args: &[JSValue]) -> String {
+        args.iter()
+            .map(|&value| self.display_string(value))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn console_write_line(&mut self, text: String, is_error: bool) -> JSValue {
+        let line = if self.console_group_depth == 0 {
+            text
+        } else {
+            format!("{}{}", "  ".repeat(self.console_group_depth), text)
+        };
+        self.console_output.push(line.clone());
+        if self.console_echo {
+            if is_error {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+        }
+        make_undefined()
+    }
+
+    fn console_label_from_args(&mut self, args: &[JSValue]) -> String {
+        args.first()
+            .map(|&value| self.display_string(value))
+            .unwrap_or_else(|| "default".to_owned())
+    }
+
+    fn console_elapsed_message(&self, label: &str, start: Instant, suffix: Option<&str>) -> String {
+        let millis = start.elapsed().as_secs_f64() * 1000.0;
+        match suffix {
+            Some(extra) if !extra.is_empty() => format!("{label}: {millis:.3}ms {extra}"),
+            _ => format!("{label}: {millis:.3}ms"),
+        }
+    }
+
+    fn console_log_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let text = self.console_render_args(args);
+        self.console_write_line(text, false)
+    }
+
+    fn console_error_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let text = self.console_render_args(args);
+        self.console_write_line(text, true)
+    }
+
+    fn console_warn_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let text = self.console_render_args(args);
+        self.console_write_line(text, true)
+    }
+
+    fn console_info_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let text = self.console_render_args(args);
+        self.console_write_line(text, false)
+    }
+
+    fn console_debug_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let text = self.console_render_args(args);
+        self.console_write_line(text, false)
+    }
+
+    fn console_trace_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let message = self.console_render_args(args);
+        let line = if message.is_empty() {
+            "Trace".to_owned()
+        } else {
+            format!("Trace: {message}")
+        };
+        self.console_write_line(line, true)
+    }
+
+    fn console_table_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let text = self.console_render_args(args);
+        self.console_write_line(text, false)
+    }
+
+    fn console_time_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let label = self.console_label_from_args(args);
+        self.console_timers.insert(label, Instant::now());
+        make_undefined()
+    }
+
+    fn console_time_end_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let label = self.console_label_from_args(args);
+        match self.console_timers.remove(&label) {
+            Some(start) => {
+                self.console_write_line(self.console_elapsed_message(&label, start, None), false)
+            }
+            None => self.console_write_line(format!("Timer '{label}' does not exist"), true),
+        }
+    }
+
+    fn console_group_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        if !args.is_empty() {
+            let line = self.console_render_args(args);
+            self.console_write_line(line, false);
+        }
+        self.console_group_depth = self.console_group_depth.saturating_add(1);
+        make_undefined()
+    }
+
+    fn console_group_end_builtin(&mut self, _args: &[JSValue]) -> JSValue {
+        self.console_group_depth = self.console_group_depth.saturating_sub(1);
+        make_undefined()
+    }
+
+    fn console_clear_builtin(&mut self) -> JSValue {
+        self.console_output.clear();
+        self.console_group_depth = 0;
+        make_undefined()
+    }
+
+    fn console_count_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let label = self.console_label_from_args(args);
+        let next = {
+            let count = self.console_counts.entry(label.clone()).or_insert(0);
+            *count += 1;
+            *count
+        };
+        self.console_write_line(format!("{label}: {next}"), false)
+    }
+
+    fn console_assert_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let condition = args.first().copied().unwrap_or_else(make_undefined);
+        if self.is_truthy_value(condition) {
+            return make_undefined();
+        }
+
+        let message = if args.len() <= 1 {
+            "Assertion failed".to_owned()
+        } else {
+            format!("Assertion failed: {}", self.console_render_args(&args[1..]))
+        };
+        self.console_write_line(message, true)
+    }
+
+    fn console_dir_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let text = self.console_render_args(args);
+        self.console_write_line(text, false)
+    }
+
+    fn console_dirxml_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let text = self.console_render_args(args);
+        self.console_write_line(text, false)
+    }
+
+    fn console_time_log_builtin(&mut self, args: &[JSValue]) -> JSValue {
+        let label = self.console_label_from_args(args);
+        let extra = if args.len() <= 1 {
+            None
+        } else {
+            Some(self.console_render_args(&args[1..]))
+        };
+        match self.console_timers.get(&label).copied() {
+            Some(start) => self.console_write_line(
+                self.console_elapsed_message(&label, start, extra.as_deref()),
+                false,
+            ),
+            None => self.console_write_line(format!("Timer '{label}' does not exist"), true),
+        }
     }
 
     fn is_truthy_value(&self, value: JSValue) -> bool {
@@ -2189,7 +3791,13 @@ impl VM {
     fn store_name_value(&mut self, name: u16, value: JSValue) {
         if let Some(scope) = self.resolve_scope_value(name) {
             let _ = self.set_property(scope, PropertyKey::Id(name), value);
-        } else if let Some(&scope) = self.scope_chain.last() {
+        } else {
+            self.global_object.insert(name, value);
+        }
+    }
+
+    fn init_name_value(&mut self, name: u16, value: JSValue) {
+        if let Some(&scope) = self.scope_chain.last() {
             let _ = self.set_property(scope, PropertyKey::Id(name), value);
         } else {
             self.global_object.insert(name, value);
@@ -2370,6 +3978,12 @@ impl VM {
                         CallAction::Returned(descriptor)
                     }
                 }
+                ObjectKind::NativeFunction(function) => {
+                    CallAction::Returned(self.dispatch_native_function(function, this_value, args))
+                }
+                ObjectKind::NativeClosure(function) => {
+                    CallAction::Returned(self.dispatch_native_closure(function, this_value, args))
+                }
                 ObjectKind::Class(class) => {
                     let base = class.base;
                     let instance = self.alloc_object_with_kind(ObjectKind::Instance(QInstance {
@@ -2514,7 +4128,18 @@ impl VM {
             let insn = self.bytecode[self.pc];
             self.pc += 1;
 
-            let opcode = Opcode::from((insn & 0xFF) as u8);
+            let opcode_byte = (insn & 0xFF) as u8;
+
+            // Try threaded dispatch for hot opcodes
+            if let Some(handler) = self.dispatch_table[opcode_byte as usize] {
+                match handler(self, insn) {
+                    ControlFlow::Continue => continue,
+                    ControlFlow::Stop => return,
+                }
+            }
+
+            // Fall back to switch for cold opcodes
+            let opcode = Opcode::from(opcode_byte);
             let a = ((insn >> 8) & 0xFF) as usize;
             let b = ((insn >> 16) & 0xFF) as usize;
             let c = ((insn >> 24) & 0xFF) as usize;
@@ -2645,12 +4270,21 @@ impl VM {
                 }
                 Opcode::LoadNull => {
                     self.frame.regs[ACC] = make_null();
+                    if a != ACC {
+                        self.frame.regs[a] = self.frame.regs[ACC];
+                    }
                 }
                 Opcode::LoadTrue => {
                     self.frame.regs[ACC] = make_true();
+                    if a != ACC {
+                        self.frame.regs[a] = self.frame.regs[ACC];
+                    }
                 }
                 Opcode::LoadFalse => {
                     self.frame.regs[ACC] = make_false();
+                    if a != ACC {
+                        self.frame.regs[a] = self.frame.regs[ACC];
+                    }
                 }
                 Opcode::LoadGlobalIc | Opcode::GetGlobal => {
                     let key = Self::decode_abx(insn) as u16;
@@ -2756,6 +4390,10 @@ impl VM {
                     if a != ACC {
                         self.frame.regs[a] = result;
                     }
+                }
+                Opcode::Mod => {
+                    let (lhs, rhs) = self.value_pair(self.frame.regs[b], self.frame.regs[c]);
+                    self.frame.regs[ACC] = lhs.rem(&rhs).raw();
                 }
                 Opcode::Neg => {
                     self.frame.regs[ACC] = self.value_op(self.frame.regs[b]).unary_minus().raw();
@@ -3000,10 +4638,15 @@ impl VM {
                     self.frame.regs[a] = env;
                 }
                 Opcode::LoadName => {
-                    self.frame.regs[ACC] = self.load_name_value(Self::decode_abx(insn) as u16);
+                    let value = self.load_name_value(Self::decode_abx(insn) as u16);
+                    self.frame.regs[a] = value;
+                    self.frame.regs[ACC] = value;
                 }
                 Opcode::StoreName => {
                     self.store_name_value(Self::decode_abx(insn) as u16, self.frame.regs[a]);
+                }
+                Opcode::InitName => {
+                    self.init_name_value(Self::decode_abx(insn) as u16, self.frame.regs[a]);
                 }
                 Opcode::NewThis => {
                     self.frame.regs[a] = self.alloc_object();
@@ -3484,97 +5127,11 @@ impl VM {
                     CallAction::Returned(result) => self.frame.regs[ACC] = result,
                     CallAction::EnteredFrame => continue,
                 },
-                Opcode::AssertValue => {
-                    // assert value - check if value is truthy
-                    if !self.is_truthy_value(self.frame.regs[a]) {
-                        panic!("Assertion failed: value is not truthy");
-                    }
-                }
-                Opcode::AssertOk => {
-                    // assert_ok value - check if value is not an error/exception
-                    if is_undefined(self.frame.regs[a]) || is_null(self.frame.regs[a]) {
-                        panic!("Assertion failed: value is not ok");
-                    }
-                }
-                Opcode::AssertEqual => {
-                    // assert_equal a, b - check if values are equal (abstract equality)
-                    if !self.abstract_equal(self.frame.regs[b], self.frame.regs[c]) {
-                        panic!("Assertion failed: values are not equal");
-                    }
-                }
-                Opcode::AssertNotEqual => {
-                    // assert_notEqual a, b - check if values are not equal
-                    if self.abstract_equal(self.frame.regs[b], self.frame.regs[c]) {
-                        panic!("Assertion failed: values are equal");
-                    }
-                }
-                Opcode::AssertDeepEqual => {
-                    // assert_deepEqual a, b - check deep equality (simplified to abstract equality for now)
-                    if !self.abstract_equal(self.frame.regs[b], self.frame.regs[c]) {
-                        panic!("Assertion failed: values are not deep equal");
-                    }
-                }
-                Opcode::AssertNotDeepEqual => {
-                    // assert_notDeepEqual a, b
-                    if self.abstract_equal(self.frame.regs[b], self.frame.regs[c]) {
-                        panic!("Assertion failed: values are deep equal");
-                    }
-                }
-                Opcode::AssertStrictEqual => {
-                    // assert_strictEqual a, b
-                    if !self.strict_equal(self.frame.regs[b], self.frame.regs[c]) {
-                        panic!("Assertion failed: values are not strictly equal");
-                    }
-                }
-                Opcode::AssertNotStrictEqual => {
-                    // assert_notStrictEqual a, b
-                    if self.strict_equal(self.frame.regs[b], self.frame.regs[c]) {
-                        panic!("Assertion failed: values are strictly equal");
-                    }
-                }
-                Opcode::AssertDeepStrictEqual => {
-                    // assert_deepStrictEqual a, b (same as strict equal for now)
-                    if !self.strict_equal(self.frame.regs[b], self.frame.regs[c]) {
-                        panic!("Assertion failed: values are not deep strictly equal");
-                    }
-                }
-                Opcode::AssertNotDeepStrictEqual => {
-                    // assert_notDeepStrictEqual a, b
-                    if self.strict_equal(self.frame.regs[b], self.frame.regs[c]) {
-                        panic!("Assertion failed: values are deep strictly equal");
-                    }
-                }
-                Opcode::AssertThrows => {
-                    // assert_throws fn - check if function throws
-                    // For now, we'll just check if it's a function
-                    if !is_object(self.frame.regs[a]) {
-                        panic!("Assertion failed: not a function");
-                    }
-                }
-                Opcode::AssertDoesNotThrow => {
-                    // assert_doesNotThrow fn - check if function doesn't throw
-                    // For now, we'll just check if it's a function
-                    if !is_object(self.frame.regs[a]) {
-                        panic!("Assertion failed: not a function");
-                    }
-                }
-                Opcode::AssertRejects => {
-                    // assert_rejects promise - check if promise rejects
-                    // Not implemented yet
-                }
-                Opcode::AssertDoesNotReject => {
-                    // assert_doesNotReject promise - check if promise doesn't reject
-                    // Not implemented yet
-                }
-                Opcode::AssertFail => {
-                    // assert_fail - always fail
-                    panic!("Assertion failed: explicit fail");
-                }
                 Opcode::AddI32 => {
                     // Fast path: int32 + int32
                     let lhs = self.frame.regs[b];
                     let rhs = self.frame.regs[c];
-                    
+
                     // Check if both are ints
                     if lhs.is_int() && rhs.is_int() {
                         let a_int = lhs.int_payload_unchecked();
@@ -3598,7 +5155,7 @@ impl VM {
                     // Fast path: f64 + f64
                     let lhs = self.frame.regs[b];
                     let rhs = self.frame.regs[c];
-                    
+
                     // Check if both are f64
                     if lhs.is_f64() && rhs.is_f64() {
                         let a_f64 = lhs.f64_payload_unchecked();
@@ -3620,7 +5177,7 @@ impl VM {
                     // Fast path: int32 - int32
                     let lhs = self.frame.regs[b];
                     let rhs = self.frame.regs[c];
-                    
+
                     if lhs.is_int() && rhs.is_int() {
                         let a_int = lhs.int_payload_unchecked();
                         let b_int = rhs.int_payload_unchecked();
@@ -3643,7 +5200,7 @@ impl VM {
                     // Fast path: f64 - f64
                     let lhs = self.frame.regs[b];
                     let rhs = self.frame.regs[c];
-                    
+
                     if lhs.is_f64() && rhs.is_f64() {
                         let a_f64 = lhs.f64_payload_unchecked();
                         let b_f64 = rhs.f64_payload_unchecked();
@@ -3664,7 +5221,7 @@ impl VM {
                     // Fast path: int32 * int32
                     let lhs = self.frame.regs[b];
                     let rhs = self.frame.regs[c];
-                    
+
                     if lhs.is_int() && rhs.is_int() {
                         let a_int = lhs.int_payload_unchecked();
                         let b_int = rhs.int_payload_unchecked();
@@ -3687,7 +5244,7 @@ impl VM {
                     // Fast path: f64 * f64
                     let lhs = self.frame.regs[b];
                     let rhs = self.frame.regs[c];
-                    
+
                     if lhs.is_f64() && rhs.is_f64() {
                         let a_f64 = lhs.f64_payload_unchecked();
                         let b_f64 = rhs.f64_payload_unchecked();
@@ -3705,6 +5262,541 @@ impl VM {
                     }
                 }
                 Opcode::Reserved(_) => {}
+                // Superinstruction handlers
+                Opcode::RetIfLteI => {
+                    // RetIfLteI a, b, c: if reg[a] <= reg[b], return reg[c]
+                    if self.less_than_or_equal(self.frame.regs[a], self.frame.regs[b]) {
+                        if !self.exit_frame(self.frame.regs[c]) {
+                            return;
+                        }
+                        if stop_at_depth == Some(self.frame.depth()) {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                Opcode::AddAccReg => {
+                    // AddAccReg a, b: ACC = reg[a] + reg[b]
+                    let (lhs, rhs) = self.value_pair(self.frame.regs[a], self.frame.regs[b]);
+                    self.frame.regs[ACC] = lhs.add(&rhs).raw();
+                }
+                Opcode::Call1Add => {
+                    // Call1Add a, b: call reg[a] with 1 arg, add result to ACC
+                    let callee = self.frame.regs[a];
+                    let arg = self.frame.regs[b];
+                    match self.dispatch_call_value(callee, self.frame.regs[0], &[arg]) {
+                        CallAction::Returned(result) => {
+                            let (lhs, rhs) = self.value_pair(self.frame.regs[ACC], result);
+                            self.frame.regs[ACC] = lhs.add(&rhs).raw();
+                        }
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                Opcode::Call2Add => {
+                    // Call2Add a, b, c: call reg[a] with 2 args, add result to ACC
+                    let callee = self.frame.regs[a];
+                    let arg1 = self.frame.regs[b];
+                    let arg2 = self.frame.regs[c];
+                    match self.dispatch_call_value(callee, self.frame.regs[0], &[arg1, arg2]) {
+                        CallAction::Returned(result) => {
+                            let (lhs, rhs) = self.value_pair(self.frame.regs[ACC], result);
+                            self.frame.regs[ACC] = lhs.add(&rhs).raw();
+                        }
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                Opcode::LoadKAdd => {
+                    // LoadKAdd a, index: reg[a] = const_pool[index] + ACC
+                    let index = Self::decode_abx(insn);
+                    let constant = self
+                        .const_pool
+                        .get(index)
+                        .copied()
+                        .unwrap_or(make_undefined());
+                    let (lhs, rhs) = self.value_pair(constant, self.frame.regs[ACC]);
+                    self.frame.regs[a] = lhs.add(&rhs).raw();
+                }
+                Opcode::LoadKCmp => {
+                    // LoadKCmp a, index: ACC = const_pool[index] < reg[a]
+                    let index = Self::decode_abx(insn);
+                    let constant = self
+                        .const_pool
+                        .get(index)
+                        .copied()
+                        .unwrap_or(make_undefined());
+                    self.frame.regs[ACC] = make_bool(self.less_than(constant, self.frame.regs[a]));
+                }
+                Opcode::CmpJmp => {
+                    // CmpJmp a, b, offset: if reg[a] < reg[b], jump by offset
+                    if self.less_than(self.frame.regs[a], self.frame.regs[b]) {
+                        self.jump_by(c as i8 as i16);
+                    }
+                }
+                Opcode::GetPropCall => {
+                    // GetPropCall a, b, key: call reg[b].key with 0 args, store result in reg[a]
+                    let key = Self::property_key_from_immediate(c as u16);
+                    let this_value = self.frame.regs[b];
+                    let callee = self.get_property(this_value, key);
+                    self.frame.regs[a] = callee;
+                    match self.dispatch_call_value(callee, this_value, &[]) {
+                        CallAction::Returned(result) => self.frame.regs[ACC] = result,
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                Opcode::CallRet => {
+                    // CallRet a, b: call reg[a] with b args, return result
+                    match self.invoke_call(a, b) {
+                        CallAction::Returned(result) => {
+                            if !self.exit_frame(result) {
+                                return;
+                            }
+                            if stop_at_depth == Some(self.frame.depth()) {
+                                return;
+                            }
+                            continue;
+                        }
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                // Specialized opcodes (stubs for now)
+                Opcode::AddI32Fast => {
+                    // Fast int32 addition (inline)
+                    let lhs = self.frame.regs[b];
+                    let rhs = self.frame.regs[c];
+                    if lhs.is_int() && rhs.is_int() {
+                        let a_int = lhs.int_payload_unchecked();
+                        let b_int = rhs.int_payload_unchecked();
+                        if let Some(result) = a_int.checked_add(b_int) {
+                            self.frame.regs[ACC] = make_int32(result);
+                            if a != ACC {
+                                self.frame.regs[a] = make_int32(result);
+                            }
+                            continue;
+                        }
+                    }
+                    // Fall back to regular AddI32
+                    let (lhs, rhs) = self.value_pair(lhs, rhs);
+                    self.frame.regs[ACC] = lhs.add(&rhs).raw();
+                    if a != ACC {
+                        self.frame.regs[a] = self.frame.regs[ACC];
+                    }
+                }
+                Opcode::AddF64Fast => {
+                    // Fast f64 addition (inline)
+                    let lhs = self.frame.regs[b];
+                    let rhs = self.frame.regs[c];
+                    if lhs.is_f64() && rhs.is_f64() {
+                        let a_f64 = lhs.f64_payload_unchecked();
+                        let b_f64 = rhs.f64_payload_unchecked();
+                        self.frame.regs[ACC] = make_number(a_f64 + b_f64);
+                        if a != ACC {
+                            self.frame.regs[a] = self.frame.regs[ACC];
+                        }
+                        continue;
+                    }
+                    // Fall back to regular AddF64
+                    let (lhs, rhs) = self.value_pair(lhs, rhs);
+                    self.frame.regs[ACC] = lhs.add(&rhs).raw();
+                    if a != ACC {
+                        self.frame.regs[a] = self.frame.regs[ACC];
+                    }
+                }
+                Opcode::SubI32Fast => {
+                    // Fast int32 subtraction (inline)
+                    let lhs = self.frame.regs[b];
+                    let rhs = self.frame.regs[c];
+                    if lhs.is_int() && rhs.is_int() {
+                        let a_int = lhs.int_payload_unchecked();
+                        let b_int = rhs.int_payload_unchecked();
+                        if let Some(result) = a_int.checked_sub(b_int) {
+                            self.frame.regs[ACC] = make_int32(result);
+                            if a != ACC {
+                                self.frame.regs[a] = make_int32(result);
+                            }
+                            continue;
+                        }
+                    }
+                    // Fall back to regular SubI32
+                    let (lhs, rhs) = self.value_pair(lhs, rhs);
+                    self.frame.regs[ACC] = lhs.sub(&rhs).raw();
+                    if a != ACC {
+                        self.frame.regs[a] = self.frame.regs[ACC];
+                    }
+                }
+                Opcode::MulI32Fast => {
+                    // Fast int32 multiplication (inline)
+                    let lhs = self.frame.regs[b];
+                    let rhs = self.frame.regs[c];
+                    if lhs.is_int() && rhs.is_int() {
+                        let a_int = lhs.int_payload_unchecked();
+                        let b_int = rhs.int_payload_unchecked();
+                        if let Some(result) = a_int.checked_mul(b_int) {
+                            self.frame.regs[ACC] = make_int32(result);
+                            if a != ACC {
+                                self.frame.regs[a] = make_int32(result);
+                            }
+                            continue;
+                        }
+                    }
+                    // Fall back to regular MulI32
+                    let (lhs, rhs) = self.value_pair(lhs, rhs);
+                    self.frame.regs[ACC] = lhs.mul(&rhs).raw();
+                    if a != ACC {
+                        self.frame.regs[a] = self.frame.regs[ACC];
+                    }
+                }
+                Opcode::EqI32Fast => {
+                    // Fast int32 equality (inline)
+                    let lhs = self.frame.regs[b];
+                    let rhs = self.frame.regs[c];
+                    if lhs.is_int() && rhs.is_int() {
+                        let a_int = lhs.int_payload_unchecked();
+                        let b_int = rhs.int_payload_unchecked();
+                        self.frame.regs[ACC] = make_bool(a_int == b_int);
+                        continue;
+                    }
+                    // Fall back to regular Eq
+                    let (lhs, rhs) = self.value_pair(lhs, rhs);
+                    self.frame.regs[ACC] = lhs.eq(&rhs).raw();
+                }
+                Opcode::LtI32Fast => {
+                    // Fast int32 less than (inline)
+                    let lhs = self.frame.regs[b];
+                    let rhs = self.frame.regs[c];
+                    if lhs.is_int() && rhs.is_int() {
+                        let a_int = lhs.int_payload_unchecked();
+                        let b_int = rhs.int_payload_unchecked();
+                        self.frame.regs[ACC] = make_bool(a_int < b_int);
+                        continue;
+                    }
+                    // Fall back to regular Lt
+                    let (lhs, rhs) = self.value_pair(lhs, rhs);
+                    self.frame.regs[ACC] = lhs.lt(&rhs).raw();
+                }
+                Opcode::JmpI32Fast => {
+                    // Fast int32 conditional jump (inline)
+                    let lhs = self.frame.regs[a];
+                    let rhs = self.frame.regs[b];
+                    if lhs.is_int() && rhs.is_int() {
+                        let a_int = lhs.int_payload_unchecked();
+                        let b_int = rhs.int_payload_unchecked();
+                        if a_int < b_int {
+                            self.jump_by(c as i8 as i16);
+                        }
+                        continue;
+                    }
+                    // Fall back to regular comparison
+                    if self.less_than(lhs, rhs) {
+                        self.jump_by(c as i8 as i16);
+                    }
+                }
+                Opcode::GetPropMono => {
+                    // Monomorphic property get (assumes shape is known)
+                    let key = Self::property_key_from_immediate(c as u16);
+                    let obj_val = self.frame.regs[b];
+                    self.frame.regs[a] = self.get_property(obj_val, key);
+                }
+                Opcode::CallMono => {
+                    // Monomorphic call (assumes callee type is known)
+                    match self.invoke_call(a, b) {
+                        CallAction::Returned(result) => self.frame.regs[ACC] = result,
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                // Call opcodes
+                Opcode::Call0 => {
+                    // Call0 a: call reg[a] with 0 args
+                    match self.dispatch_call_value(self.frame.regs[a], self.frame.regs[0], &[]) {
+                        CallAction::Returned(result) => self.frame.regs[ACC] = result,
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                Opcode::Call1 => {
+                    // Call1 a, b: call reg[a] with 1 arg (reg[b])
+                    match self.dispatch_call_value(
+                        self.frame.regs[a],
+                        self.frame.regs[0],
+                        &[self.frame.regs[b]],
+                    ) {
+                        CallAction::Returned(result) => self.frame.regs[ACC] = result,
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                Opcode::Call2 => {
+                    // Call2 a, b, c: call reg[a] with 2 args (reg[b], reg[c])
+                    match self.dispatch_call_value(
+                        self.frame.regs[a],
+                        self.frame.regs[0],
+                        &[self.frame.regs[b], self.frame.regs[c]],
+                    ) {
+                        CallAction::Returned(result) => self.frame.regs[ACC] = result,
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                Opcode::Call3 => {
+                    // Call3 a, b, c, d: call reg[a] with 3 args (reg[b], reg[c], reg[d])
+                    let d = ((insn >> 8) & 0xFF) as usize; // Note: reusing 'a' field for 4th arg
+                    match self.dispatch_call_value(
+                        self.frame.regs[a],
+                        self.frame.regs[0],
+                        &[self.frame.regs[b], self.frame.regs[c], self.frame.regs[d]],
+                    ) {
+                        CallAction::Returned(result) => self.frame.regs[ACC] = result,
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                Opcode::CallMethod1 => {
+                    // CallMethod1 a, slot: call reg[a].slot with 1 arg from reg[a + 1]
+                    let this_value = self.frame.regs[a];
+                    let slot = Self::decode_abx(insn) as u16;
+                    let arg = self
+                        .frame
+                        .regs
+                        .get(a + 1)
+                        .copied()
+                        .unwrap_or(make_undefined());
+                    let method = self.get_property(this_value, PropertyKey::Id(slot));
+                    match self.dispatch_call_value(method, this_value, &[arg]) {
+                        CallAction::Returned(result) => self.frame.regs[ACC] = result,
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                Opcode::CallMethod2 => {
+                    // CallMethod2 a, slot: call reg[a].slot with args from reg[a + 1], reg[a + 2]
+                    let this_value = self.frame.regs[a];
+                    let slot = Self::decode_abx(insn) as u16;
+                    let arg1 = self
+                        .frame
+                        .regs
+                        .get(a + 1)
+                        .copied()
+                        .unwrap_or(make_undefined());
+                    let arg2 = self
+                        .frame
+                        .regs
+                        .get(a + 2)
+                        .copied()
+                        .unwrap_or(make_undefined());
+                    let method = self.get_property(this_value, PropertyKey::Id(slot));
+                    match self.dispatch_call_value(method, this_value, &[arg1, arg2]) {
+                        CallAction::Returned(result) => self.frame.regs[ACC] = result,
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                // New arithmetic superinstructions
+                Opcode::LoadAdd => {
+                    // LoadAdd a, b, c: reg[a] = reg[b] + reg[c]
+                    let lhs = self.frame.regs[b];
+                    let rhs = self.frame.regs[c];
+
+                    // Fast path: int32 + int32
+                    if lhs.is_int() && rhs.is_int() {
+                        let a_int = lhs.int_payload_unchecked();
+                        let b_int = rhs.int_payload_unchecked();
+                        if let Some(result) = a_int.checked_add(b_int) {
+                            self.frame.regs[a] = make_int32(result);
+                            continue;
+                        }
+                    }
+                    // Fall back to slow path
+                    let (lhs, rhs) = self.value_pair(lhs, rhs);
+                    self.frame.regs[a] = lhs.add(&rhs).raw();
+                }
+                Opcode::LoadSub => {
+                    // LoadSub a, b, c: reg[a] = reg[b] - reg[c]
+                    let lhs = self.frame.regs[b];
+                    let rhs = self.frame.regs[c];
+
+                    // Fast path: int32 - int32
+                    if lhs.is_int() && rhs.is_int() {
+                        let a_int = lhs.int_payload_unchecked();
+                        let b_int = rhs.int_payload_unchecked();
+                        if let Some(result) = a_int.checked_sub(b_int) {
+                            self.frame.regs[a] = make_int32(result);
+                            continue;
+                        }
+                    }
+                    // Fall back to slow path
+                    let (lhs, rhs) = self.value_pair(lhs, rhs);
+                    self.frame.regs[a] = lhs.sub(&rhs).raw();
+                }
+                Opcode::LoadMul => {
+                    // LoadMul a, b, c: reg[a] = reg[b] * reg[c]
+                    let lhs = self.frame.regs[b];
+                    let rhs = self.frame.regs[c];
+
+                    // Fast path: int32 * int32
+                    if lhs.is_int() && rhs.is_int() {
+                        let a_int = lhs.int_payload_unchecked();
+                        let b_int = rhs.int_payload_unchecked();
+                        if let Some(result) = a_int.checked_mul(b_int) {
+                            self.frame.regs[a] = make_int32(result);
+                            continue;
+                        }
+                    }
+                    // Fall back to slow path
+                    let (lhs, rhs) = self.value_pair(lhs, rhs);
+                    self.frame.regs[a] = lhs.mul(&rhs).raw();
+                }
+                Opcode::LoadInc => {
+                    // LoadInc a, b: reg[a] = reg[b] + 1
+                    let value = self.frame.regs[b];
+
+                    // Fast path: int32 + 1
+                    if value.is_int() {
+                        let int_val = value.int_payload_unchecked();
+                        if let Some(result) = int_val.checked_add(1) {
+                            self.frame.regs[a] = make_int32(result);
+                            continue;
+                        }
+                    }
+                    // Fall back to slow path
+                    let (lhs, rhs) = self.value_pair(value, make_number(1.0));
+                    let result = lhs.add(&rhs).raw();
+                    self.frame.regs[a] = result;
+                }
+                Opcode::LoadDec => {
+                    // LoadDec a, b: reg[a] = reg[b] - 1
+                    let value = self.frame.regs[b];
+
+                    // Fast path: int32 - 1
+                    if value.is_int() {
+                        let int_val = value.int_payload_unchecked();
+                        if let Some(result) = int_val.checked_sub(1) {
+                            self.frame.regs[a] = make_int32(result);
+                            continue;
+                        }
+                    }
+                    // Fall back to slow path
+                    let (lhs, rhs) = self.value_pair(value, make_number(1.0));
+                    self.frame.regs[a] = lhs.sub(&rhs).raw();
+                }
+                // New comparison superinstructions
+                Opcode::LoadCmpEq => {
+                    // LoadCmpEq a, b, c: reg[a] = reg[b] == reg[c]
+                    let (lhs, rhs) = self.value_pair(self.frame.regs[b], self.frame.regs[c]);
+                    self.frame.regs[a] = lhs.eq(&rhs).raw();
+                }
+                Opcode::LoadCmpLt => {
+                    // LoadCmpLt a, b, c: reg[a] = reg[b] < reg[c]
+                    let (lhs, rhs) = self.value_pair(self.frame.regs[b], self.frame.regs[c]);
+                    self.frame.regs[a] = lhs.lt(&rhs).raw();
+                }
+                Opcode::LoadJfalse => {
+                    // LoadJfalse a, offset: if !reg[a], jump by offset
+                    if !self.is_truthy_value(self.frame.regs[a]) {
+                        self.jump_by(b as i8 as i16);
+                    }
+                }
+                Opcode::LoadCmpEqJfalse => {
+                    // LoadCmpEqJfalse a, b, offset: if reg[a] == reg[b], jump by offset
+                    if self.abstract_equal(self.frame.regs[a], self.frame.regs[b]) {
+                        self.jump_by(c as i8 as i16);
+                    }
+                }
+                Opcode::LoadCmpLtJfalse => {
+                    // LoadCmpLtJfalse a, b, offset: if reg[a] < reg[b], jump by offset
+                    if self.less_than(self.frame.regs[a], self.frame.regs[b]) {
+                        self.jump_by(c as i8 as i16);
+                    }
+                }
+                // Property access superinstructions
+                Opcode::LoadGetProp => {
+                    // LoadGetProp a, prop: ACC = R[a][prop]
+                    let key = Self::property_key_from_immediate(b as u16);
+                    self.frame.regs[ACC] = self.get_property(self.frame.regs[a], key);
+                }
+                Opcode::LoadGetPropCmpEq => {
+                    // LoadGetPropCmpEq a, prop, b: ACC = (R[a][prop] == R[b])
+                    let key = Self::property_key_from_immediate(b as u16);
+                    let prop_value = self.get_property(self.frame.regs[a], key);
+                    let (lhs, rhs) = self.value_pair(prop_value, self.frame.regs[c]);
+                    self.frame.regs[ACC] = lhs.eq(&rhs).raw();
+                }
+                // Pareto 80% property access superinstructions with IC
+                Opcode::GetProp2Ic => {
+                    // GetProp2Ic dst, obj, slot1, slot2: dst = obj.slot1.slot2
+                    let obj_val = self.frame.regs[b];
+                    let slot1 = c as u16;
+                    let slot2 = ((insn >> 8) & 0xFF) as u16; // Use 'a' field for second slot
+                    let intermediate = self.get_property(obj_val, PropertyKey::Id(slot1));
+                    self.frame.regs[a] = self.get_property(intermediate, PropertyKey::Id(slot2));
+                }
+                Opcode::GetProp3Ic => {
+                    // GetProp3Ic dst, obj, slot1, slot2, slot3: dst = obj.slot1.slot2.slot3
+                    let obj_val = self.frame.regs[b];
+                    let slot1 = c as u16;
+                    let slot2 = ((insn >> 8) & 0xFF) as u16; // Use 'a' field for second slot
+                    let slot3 = ((insn >> 16) & 0xFF) as u16; // Use 'b' field for third slot
+                    let intermediate1 = self.get_property(obj_val, PropertyKey::Id(slot1));
+                    let intermediate2 = self.get_property(intermediate1, PropertyKey::Id(slot2));
+                    self.frame.regs[a] = self.get_property(intermediate2, PropertyKey::Id(slot3));
+                }
+                Opcode::GetElem => {
+                    // GetElem dst, arr, index: dst = arr[index]
+                    let arr_val = self.frame.regs[b];
+                    let index_val = self.frame.regs[c];
+                    let key = self.property_key_from_value(index_val);
+                    self.frame.regs[a] = self.get_property(arr_val, key);
+                }
+                Opcode::SetElem => {
+                    // SetElem arr, index, src: arr[index] = src
+                    let arr_val = self.frame.regs[b];
+                    let index_val = self.frame.regs[c];
+                    let key = self.property_key_from_value(index_val);
+                    self.frame.regs[ACC] = self.set_property(arr_val, key, self.frame.regs[a]);
+                }
+                Opcode::GetPropElem => {
+                    // GetPropElem dst, obj, slot, index: dst = obj.slot[index]
+                    let obj_val = self.frame.regs[b];
+                    let slot = c as u16;
+                    let index_val = self.frame.regs[a]; // Use 'a' field for index
+                    let intermediate = self.get_property(obj_val, PropertyKey::Id(slot));
+                    let key = self.property_key_from_value(index_val);
+                    self.frame.regs[a] = self.get_property(intermediate, key);
+                }
+                Opcode::CallMethodIc => {
+                    // CallMethodIc obj, slot: call obj.slot() with 0 args
+                    let this_value = self.frame.regs[a];
+                    let slot = b as u16;
+                    let method = self.get_property(this_value, PropertyKey::Id(slot));
+                    match self.dispatch_call_value(method, this_value, &[]) {
+                        CallAction::Returned(result) => self.frame.regs[ACC] = result,
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                Opcode::CallMethod2Ic => {
+                    // CallMethod2Ic obj, slot1, slot2: call obj.slot1.slot2() with 0 args
+                    let this_value = self.frame.regs[a];
+                    let slot1 = b as u16;
+                    let slot2 = c as u16;
+                    let intermediate = self.get_property(this_value, PropertyKey::Id(slot1));
+                    let method = self.get_property(intermediate, PropertyKey::Id(slot2));
+                    match self.dispatch_call_value(method, this_value, &[]) {
+                        CallAction::Returned(result) => self.frame.regs[ACC] = result,
+                        CallAction::EnteredFrame => continue,
+                    }
+                }
+                // Assertion opcodes (stubs for now)
+                Opcode::AssertValue
+                | Opcode::AssertOk
+                | Opcode::AssertFail
+                | Opcode::AssertThrows
+                | Opcode::AssertDoesNotThrow
+                | Opcode::AssertRejects
+                | Opcode::AssertDoesNotReject
+                | Opcode::AssertEqual
+                | Opcode::AssertNotEqual
+                | Opcode::AssertDeepEqual
+                | Opcode::AssertNotDeepEqual
+                | Opcode::AssertStrictEqual
+                | Opcode::AssertNotStrictEqual
+                | Opcode::AssertDeepStrictEqual
+                | Opcode::AssertNotDeepStrictEqual => {
+                    // Assertion opcodes are no-ops in production
+                    // They're only used during testing/development
+                    self.frame.regs[ACC] = make_true();
+                }
             }
         }
     }

@@ -2,6 +2,15 @@
 
 use vm::asm::{disassemble, disassemble_clean};
 use vm::js_value::make_number;
+use vm::vm::Opcode;
+
+fn encode_abc(opcode: Opcode, a: u8, b: u8, c: u8) -> u32 {
+    ((c as u32) << 24) | ((b as u32) << 16) | ((a as u32) << 8) | opcode.as_u8() as u32
+}
+
+fn encode_abx(opcode: Opcode, a: u8, bx: u16) -> u32 {
+    ((bx as u32) << 16) | ((a as u32) << 8) | opcode.as_u8() as u32
+}
 
 fn main() {
     println!("=== Assembly Code Generation for Assertion Opcodes ===\n");
@@ -9,19 +18,19 @@ fn main() {
     // Create some bytecode with assertion opcodes
     let bytecode = vec![
         // mov r1, r2, r0
-        ((0 as u32) << 24) | ((2 as u32) << 16) | ((1 as u32) << 8) | 0,
+        encode_abc(Opcode::Mov, 1, 2, 0),
         // load_k r3, const[0] (42.0)
-        ((0 as u32) << 16) | ((3 as u32) << 8) | 1,
+        encode_abx(Opcode::LoadK, 3, 0),
         // add r1, r2
-        ((2 as u32) << 16) | ((1 as u32) << 8) | 2,
+        encode_abc(Opcode::Add, 0, 1, 2),
         // assert_equal r1, r2
-        ((2 as u32) << 16) | ((1 as u32) << 8) | 227, // 227 = AssertEqual
+        encode_abc(Opcode::AssertEqual, 0, 1, 2),
         // assert_ok
-        ((0 as u32) << 8) | 226, // 226 = AssertOk
+        Opcode::AssertOk.as_u8() as u32,
         // assert_fail
-        ((0 as u32) << 8) | 239, // 239 = AssertFail
+        Opcode::AssertFail.as_u8() as u32,
         // ret
-        ((0 as u32) << 8) | 103,
+        Opcode::Ret.as_u8() as u32,
     ];
 
     let constants = vec![make_number(42.0)];
@@ -54,30 +63,34 @@ fn main() {
     println!("----------------------");
 
     let assertion_opcodes = vec![
-        (225, "assert_value"),
-        (226, "assert_ok"),
-        (227, "assert_equal"),
-        (228, "assert_not_equal"),
-        (229, "assert_deep_equal"),
-        (230, "assert_not_deep_equal"),
-        (231, "assert_strict_equal"),
-        (232, "assert_not_strict_equal"),
-        (233, "assert_deep_strict_equal"),
-        (234, "assert_not_deep_strict_equal"),
-        (235, "assert_throws"),
-        (236, "assert_does_not_throw"),
-        (237, "assert_rejects"),
-        (238, "assert_does_not_reject"),
-        (239, "assert_fail"),
+        (Opcode::AssertValue, "assert_value"),
+        (Opcode::AssertOk, "assert_ok"),
+        (Opcode::AssertEqual, "assert_equal"),
+        (Opcode::AssertNotEqual, "assert_not_equal"),
+        (Opcode::AssertDeepEqual, "assert_deep_equal"),
+        (Opcode::AssertNotDeepEqual, "assert_not_deep_equal"),
+        (Opcode::AssertStrictEqual, "assert_strict_equal"),
+        (Opcode::AssertNotStrictEqual, "assert_not_strict_equal"),
+        (Opcode::AssertDeepStrictEqual, "assert_deep_strict_equal"),
+        (
+            Opcode::AssertNotDeepStrictEqual,
+            "assert_not_deep_strict_equal",
+        ),
+        (Opcode::AssertThrows, "assert_throws"),
+        (Opcode::AssertDoesNotThrow, "assert_does_not_throw"),
+        (Opcode::AssertRejects, "assert_rejects"),
+        (Opcode::AssertDoesNotReject, "assert_does_not_reject"),
+        (Opcode::AssertFail, "assert_fail"),
     ];
 
-    for (opcode_num, expected_name) in assertion_opcodes {
-        let instr = ((0 as u32) << 8) | opcode_num as u32;
+    for (opcode, expected_name) in assertion_opcodes {
+        let opcode_num = opcode.as_u8();
+        let instr = opcode_num as u32;
         let bytecode_single = vec![instr];
         let asm_single = disassemble(&bytecode_single, &constants);
         println!(
-            "  Opcode {} (0x{:02X}): {}",
-            opcode_num, opcode_num, asm_single[0]
+            "  Opcode {} (0x{:02X}) {}: {}",
+            opcode_num, opcode_num, expected_name, asm_single[0]
         );
     }
 }

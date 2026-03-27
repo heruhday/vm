@@ -84,10 +84,15 @@ fn main() {
     }
 
     let mut timings = Vec::with_capacity(MEASURED_RUNS);
+    let mut timings2 = Vec::with_capacity(MEASURED_RUNS);
+
     let mut result = make_number(0.0);
     for _ in 0..MEASURED_RUNS {
         let mut vm = VM::new(bytecode.clone(), constants.clone(), vec![]);
+        let start2 = std::time::Instant::now();
         vm.optimize();
+        timings2.push(start2.elapsed());
+
         let start = std::time::Instant::now();
         vm.run(false);
         timings.push(start.elapsed());
@@ -101,6 +106,15 @@ fn main() {
     println!(
         "Execution time over {MEASURED_RUNS} runs: avg {:.2?}, min {:.2?}, max {:.2?}",
         avg, min, max
+    );
+
+    let total2 = timings2.iter().copied().sum::<std::time::Duration>();
+    let min2 = timings2.iter().copied().min().unwrap_or_default();
+    let max2 = timings2.iter().copied().max().unwrap_or_default();
+    let avg2 = total2 / MEASURED_RUNS as u32;
+    println!(
+        "Optimization time over {MEASURED_RUNS} runs: avg {:.2?}, min {:.2?}, max {:.2?}",
+        avg2, min2, max2
     );
 
     println!("\n=== Result ===");
